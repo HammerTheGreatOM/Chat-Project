@@ -60,6 +60,20 @@ function requireMaster(req, res, next) {
   next();
 }
 
+// Parse command args — quoted first arg supported e.g. /ban "John Doe" reason
+function parseArgs(argStr) {
+  argStr = argStr.trim();
+  if (argStr.startsWith('"')) {
+    const end = argStr.indexOf('"', 1);
+    if (end !== -1) {
+      const name = argStr.slice(1, end);
+      const rest = argStr.slice(end + 1).trim();
+      return [name, ...rest.split(' ').filter(Boolean)];
+    }
+  }
+  return argStr.split(' ').filter(Boolean);
+}
+
 function postSystemMessage(roomId, content) {
   if (!db.prepare('SELECT id FROM rooms WHERE id = ?').get(roomId)) return;
   // Use NULL for user_id on system messages — disable FK check temporarily
@@ -169,7 +183,7 @@ app.post('/api/rooms/:id/messages', (req, res) => {
   if (trimmed.startsWith('/')) {
     const parts = trimmed.slice(1).split(' ');
     const cmd = parts[0].toLowerCase();
-    const args = parts.slice(1);
+    const args = parseArgs(parts.slice(1).join(' '));
 
     // /help — available to everyone
     if (cmd === 'help') {
