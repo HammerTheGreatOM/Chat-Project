@@ -61,10 +61,12 @@ function requireMaster(req, res, next) {
 }
 
 function postSystemMessage(roomId, content) {
-  const general = db.prepare('SELECT id FROM rooms WHERE id = ?').get(roomId);
-  if (!general) return;
+  if (!db.prepare('SELECT id FROM rooms WHERE id = ?').get(roomId)) return;
+  // Use NULL for user_id on system messages — disable FK check temporarily
+  db.pragma('foreign_keys = OFF');
   db.prepare('INSERT INTO messages (room_id, user_id, username, color, content, is_system) VALUES (?, 0, ?, ?, ?, 1)')
     .run(roomId, 'System', '#888899', content);
+  db.pragma('foreign_keys = ON');
 }
 
 // ── User routes ───────────────────────────────────────────────────────────────
