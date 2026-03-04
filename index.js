@@ -161,7 +161,7 @@ app.get('/api/rooms/:id/messages', (req, res) => {
   const room = db.prepare('SELECT * FROM rooms WHERE id = ?').get(req.params.id);
   if (!room) return res.status(404).json({ error: 'Room not found' });
   if (room.is_private && !isMaster(roomPassword) && room.password !== roomPassword) return res.status(403).json({ error: 'Wrong room password' });
-  res.json(db.prepare(`SELECT id, username, color, content, is_system, created_at FROM messages WHERE room_id = ? ORDER BY created_at ASC LIMIT 200`).all(req.params.id));
+  res.json(db.prepare(`SELECT id, username, color, content, is_system, created_at FROM messages WHERE room_id = ? ORDER BY created_at ASC LIMIT 150`).all(req.params.id));
 });
 
 app.post('/api/rooms/:id/messages', (req, res) => {
@@ -319,6 +319,17 @@ app.post('/api/rooms/:id/messages', (req, res) => {
   db.prepare('INSERT INTO messages (room_id, user_id, username, color, content, ip) VALUES (?, ?, ?, ?, ?, ?)').run(room.id, user.id, user.username, user.color, content.trim(), ip);
   db.prepare('UPDATE rooms SET message_count = message_count + 1 WHERE id = ?').run(room.id);
   logIp(ip, user.id, user.username, 'message');
+
+  // Trim oldest messages if room exceeds 150 to keep response size manageable
+  const MSG_CAP = 150;
+  const count = db.prepare('SELECT COUNT(*) as c FROM messages WHERE room_id = ? AND is_system = 0').get(room.id).c;
+  if (count > MSG_CAP) {
+    const excess = count - MSG_CAP;
+    const oldest = db.prepare('SELECT id FROM messages WHERE room_id = ? AND is_system = 0 ORDER BY created_at ASC LIMIT ?').all(room.id, excess);
+    const ids = oldest.map(m => m.id);
+    db.prepare(`DELETE FROM messages WHERE id IN (${ids.join(',')})`).run();
+  }
+
   res.json({ success: true });
 });
 
