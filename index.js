@@ -3,7 +3,7 @@ const cors = require('cors');
 const Database = require('better-sqlite3');
 
 const app = express();
-const db = new Database('chat.db');
+const db = new Database('/app/data/chat.db');
 
 const MASTER_PASSWORD = '582624';
 
