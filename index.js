@@ -762,5 +762,156 @@ app.get('/api/posts/feed/:userId', (req, res) => {
   res.json(enrichPosts(posts, me.id));
 });
 
+
+// ════════════════════════════════════════════════
+//  WHITEBOARD — shared drawing boards
+// ════════════════════════════════════════════════
+const WB_STROKE_CAP = 2000; // max strokes per board before oldest trimmed
+const WB_BOARDS_CAP = 50;   // max total boards
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS boards (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    room_code TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL DEFAULT 'Untitled',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )
+`);
+db.exec(`
+  CREATE TABLE IF NOT EXISTS strokes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    board_id INTEGER NOT NULL,
+    user_id INTEGER,
+    username TEXT NOT NULL DEFAULT 'Guest',
+    color TEXT NOT NULL DEFAULT '#4fc3f7',
+    width INTEGER NOT NULL DEFAULT 4,
+    points TEXT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(board_id) REFERENCES boards(id) ON DELETE CASCADE
+  )
+`);
+db.exec(`CREATE INDEX IF NOT EXISTS idx_strokes_board ON strokes(board_id, id)`);
+
+// Daily reset of boards
+function resetBoards() {
+  db.prepare('DELETE FROM strokes').run();
+  db.prepare('DELETE FROM boards').run();
+  console.log(`[${new Date().toISOString()}] Daily boards reset.`);
+}
+function scheduleBoardReset() {
+  const next = new Date();
+  next.setUTCHours(0, 0, 0, 0);
+  next.setUTCDate(next.getUTCDate() + 1);
+  setTimeout(() => { resetBoards(); scheduleBoardReset(); }, next - new Date());
+}
+scheduleBoardReset();
+
+function genCode() {
+  return Math.random().toString(36).slice(2,8).toUpperCase();
+}
+
+function trimStrokes(boardId) {
+  const row = db.prepare('SELECT COUNT(*) as c FROM strokes WHERE board_id = ?').get(boardId);
+  if (row.c <= WB_STROKE_CAP) return;
+  const excess = row.c - WB_STROKE_CAP;
+  const cutoff = db.prepare('SELECT id FROM strokes WHERE board_id = ? ORDER BY id ASC LIMIT 1 OFFSET ?').get(boardId, excess);
+  if (cutoff) db.prepare('DELETE FROM strokes WHERE board_id = ? AND id < ?').run(boardId, cutoff.id);
+}
+
+// GET /api/boards — list all public boards
+app.get('/api/boards', (req, res) => {
+  const boards = db.prepare(`
+    SELECT b.id, b.room_code, b.name, b.updated_at,
+      COUNT(s.id) as stroke_count
+    FROM boards b
+    LEFT JOIN strokes s ON s.board_id = b.id
+    GROUP BY b.id
+    ORDER BY b.updated_at DESC
+    LIMIT 50
+  `).all();
+  res.json(boards);
+});
+
+// POST /api/boards — create a new board
+app.post('/api/boards', (req, res) => {
+  const { name } = req.body;
+  // trim total boards if over cap
+  const total = db.prepare('SELECT COUNT(*) as c FROM boards').get().c;
+  if (total >= WB_BOARDS_CAP) {
+    const oldest = db.prepare('SELECT id FROM boards ORDER BY updated_at ASC LIMIT 1').get();
+    if (oldest) {
+      db.prepare('DELETE FROM strokes WHERE board_id = ?').run(oldest.id);
+      db.prepare('DELETE FROM boards WHERE id = ?').run(oldest.id);
+    }
+  }
+  let code = genCode();
+  // ensure unique
+  while (db.prepare('SELECT id FROM boards WHERE room_code = ?').get(code)) code = genCode();
+  const result = db.prepare('INSERT INTO boards (room_code, name) VALUES (?, ?)').run(code, (name || 'Untitled').slice(0,40));
+  res.json({ success: true, id: result.lastInsertRowid, room_code: code });
+});
+
+// GET /api/boards/:code — get board + all strokes since ?after=id
+app.get('/api/boards/:code', (req, res) => {
+  const board = db.prepare('SELECT * FROM boards WHERE room_code = ?').get(req.params.code);
+  if (!board) return res.status(404).json({ error: 'Board not found' });
+  const after = parseInt(req.query.after) || 0;
+  const strokes = db.prepare(
+    'SELECT id, username, color, width, points FROM strokes WHERE board_id = ? AND id > ? ORDER BY id ASC'
+  ).all(board.id, after);
+  res.json({ board, strokes });
+});
+
+// POST /api/boards/:code/strokes — add a stroke
+app.post('/api/boards/:code/strokes', (req, res) => {
+  const { username, color, width, points, userId, password } = req.body;
+  if (!points || !Array.isArray(points) || points.length < 2) return res.status(400).json({ error: 'Invalid stroke' });
+  const board = db.prepare('SELECT * FROM boards WHERE room_code = ?').get(req.params.code);
+  if (!board) return res.status(404).json({ error: 'Board not found' });
+  // Optional auth — if userId+password provided, use real username
+  let finalUsername = (username || 'Guest').slice(0, 24);
+  let finalUserId = null;
+  if (userId && password) {
+    const user = db.prepare('SELECT * FROM users WHERE id = ?').get(userId);
+    if (user && user.password === password && !user.banned) {
+      finalUsername = user.username;
+      finalUserId = user.id;
+    }
+  }
+  const finalColor = (color || '#4fc3f7').slice(0,7);
+  const finalWidth = Math.min(Math.max(parseInt(width)||4, 1), 40);
+  const result = db.prepare(
+    'INSERT INTO strokes (board_id, user_id, username, color, width, points) VALUES (?, ?, ?, ?, ?, ?)'
+  ).run(board.id, finalUserId, finalUsername, finalColor, finalWidth, JSON.stringify(points));
+  db.prepare('UPDATE boards SET updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(board.id);
+  trimStrokes(board.id);
+  res.json({ success: true, id: result.lastInsertRowid });
+});
+
+// DELETE /api/boards/:code/strokes — clear board (auth required, any valid user)
+app.delete('/api/boards/:code/strokes', (req, res) => {
+  const { userId, password } = req.body;
+  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(userId);
+  if (!user || user.password !== password) return res.status(401).json({ error: 'Invalid credentials' });
+  const board = db.prepare('SELECT * FROM boards WHERE room_code = ?').get(req.params.code);
+  if (!board) return res.status(404).json({ error: 'Board not found' });
+  db.prepare('DELETE FROM strokes WHERE board_id = ?').run(board.id);
+  db.prepare('UPDATE boards SET updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(board.id);
+  res.json({ success: true });
+});
+
+// DELETE /api/boards/:code — delete whole board
+app.delete('/api/boards/:code', (req, res) => {
+  const { userId, password } = req.body;
+  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(userId);
+  if (!user || user.password !== password) return res.status(401).json({ error: 'Invalid credentials' });
+  const board = db.prepare('SELECT * FROM boards WHERE room_code = ?').get(req.params.code);
+  if (!board) return res.status(404).json({ error: 'Board not found' });
+  db.prepare('DELETE FROM strokes WHERE board_id = ?').run(board.id);
+  db.prepare('DELETE FROM boards WHERE id = ?').run(board.id);
+  res.json({ success: true });
+});
+
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => console.log(`Chat server running on port ${PORT}`));
