@@ -581,5 +581,186 @@ app.get('/api/dm/:myId/inbox', (req, res) => {
   res.json(convos);
 });
 
+
+// ════════════════════════════════════════════════
+//  SOCIAL — posts, likes, follows
+// ════════════════════════════════════════════════
+const POST_CAP = 500;
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS posts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    username TEXT NOT NULL,
+    color TEXT NOT NULL DEFAULT '#f1c40f',
+    content TEXT NOT NULL,
+    like_count INTEGER NOT NULL DEFAULT 0,
+    reply_to INTEGER,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+    FOREIGN KEY(reply_to) REFERENCES posts(id) ON DELETE CASCADE
+  )
+`);
+db.exec(`
+  CREATE TABLE IF NOT EXISTS post_likes (
+    user_id INTEGER NOT NULL,
+    post_id INTEGER NOT NULL,
+    PRIMARY KEY(user_id, post_id),
+    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+    FOREIGN KEY(post_id) REFERENCES posts(id) ON DELETE CASCADE
+  )
+`);
+db.exec(`
+  CREATE TABLE IF NOT EXISTS follows (
+    follower_id INTEGER NOT NULL,
+    following_id INTEGER NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY(follower_id, following_id),
+    FOREIGN KEY(follower_id) REFERENCES users(id) ON DELETE CASCADE,
+    FOREIGN KEY(following_id) REFERENCES users(id) ON DELETE CASCADE
+  )
+`);
+db.exec(`CREATE INDEX IF NOT EXISTS idx_posts_user ON posts(user_id, id)`);
+db.exec(`CREATE INDEX IF NOT EXISTS idx_posts_reply ON posts(reply_to)`);
+
+// Daily reset of posts
+function resetPosts() {
+  db.prepare('DELETE FROM posts').run();
+  db.prepare('DELETE FROM post_likes').run();
+  console.log(`[${new Date().toISOString()}] Daily posts reset.`);
+}
+function schedulePostReset() {
+  const next = new Date();
+  next.setUTCHours(0, 0, 0, 0);
+  next.setUTCDate(next.getUTCDate() + 1);
+  setTimeout(() => { resetPosts(); schedulePostReset(); }, next - new Date());
+}
+schedulePostReset();
+
+// Trim oldest top-level posts when over cap
+const trimPosts = db.transaction(() => {
+  const row = db.prepare('SELECT COUNT(*) as c FROM posts WHERE reply_to IS NULL').get();
+  if (row.c <= POST_CAP) return;
+  const excess = row.c - POST_CAP;
+  const cutoff = db.prepare('SELECT id FROM posts WHERE reply_to IS NULL ORDER BY id ASC LIMIT 1 OFFSET ?').get(excess);
+  if (cutoff) db.prepare('DELETE FROM posts WHERE id <= ? OR reply_to <= ?').run(cutoff.id, cutoff.id);
+});
+
+function enrichPosts(posts, viewerId) {
+  if (!posts.length) return [];
+  const likedIds = viewerId
+    ? new Set(db.prepare(`SELECT post_id FROM post_likes WHERE user_id = ? AND post_id IN (${posts.map(()=>'?').join(',')})`).all(viewerId, ...posts.map(p=>p.id)).map(r=>r.post_id))
+    : new Set();
+  return posts.map(p => ({ ...p, liked: likedIds.has(p.id) }));
+}
+
+// GET /api/posts — global feed
+app.get('/api/posts', (req, res) => {
+  const viewerId = parseInt(req.query.userId) || null;
+  const before = parseInt(req.query.before) || null;
+  const limit = Math.min(parseInt(req.query.limit) || 30, 60);
+  const posts = before
+    ? db.prepare('SELECT * FROM posts WHERE reply_to IS NULL AND id < ? ORDER BY id DESC LIMIT ?').all(before, limit)
+    : db.prepare('SELECT * FROM posts WHERE reply_to IS NULL ORDER BY id DESC LIMIT ?').all(limit);
+  res.json(enrichPosts(posts, viewerId));
+});
+
+// GET /api/posts/user/:userId — profile posts
+app.get('/api/posts/user/:userId', (req, res) => {
+  const viewerId = parseInt(req.query.viewerId) || null;
+  const user = db.prepare('SELECT id, username, color FROM users WHERE id = ?').get(req.params.userId);
+  if (!user) return res.status(404).json({ error: 'User not found' });
+  const posts = db.prepare('SELECT * FROM posts WHERE user_id = ? AND reply_to IS NULL ORDER BY id DESC LIMIT 60').all(req.params.userId);
+  const followerCount = db.prepare('SELECT COUNT(*) as c FROM follows WHERE following_id = ?').get(req.params.userId).c;
+  const followingCount = db.prepare('SELECT COUNT(*) as c FROM follows WHERE follower_id = ?').get(req.params.userId).c;
+  const isFollowing = viewerId ? !!db.prepare('SELECT 1 FROM follows WHERE follower_id = ? AND following_id = ?').get(viewerId, req.params.userId) : false;
+  res.json({ user, posts: enrichPosts(posts, viewerId), followerCount, followingCount, isFollowing });
+});
+
+// GET /api/posts/:id — single post + replies
+app.get('/api/posts/:id', (req, res) => {
+  const viewerId = parseInt(req.query.userId) || null;
+  const post = db.prepare('SELECT * FROM posts WHERE id = ?').get(req.params.id);
+  if (!post) return res.status(404).json({ error: 'Post not found' });
+  const replies = db.prepare('SELECT * FROM posts WHERE reply_to = ? ORDER BY id ASC LIMIT 100').all(req.params.id);
+  res.json({ post: enrichPosts([post], viewerId)[0], replies: enrichPosts(replies, viewerId) });
+});
+
+// POST /api/posts — create post or reply
+app.post('/api/posts', (req, res) => {
+  const { userId, password, content, replyTo } = req.body;
+  if (!content || !content.trim()) return res.status(400).json({ error: 'Content required' });
+  if (content.length > 500) return res.status(400).json({ error: 'Max 500 characters' });
+  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(userId);
+  if (!user || user.password !== password) return res.status(401).json({ error: 'Invalid credentials' });
+  if (user.banned) return res.status(403).json({ error: 'You are banned' });
+  if (user.muted) return res.status(403).json({ error: 'You are muted' });
+  if (replyTo && !db.prepare('SELECT id FROM posts WHERE id = ?').get(replyTo)) return res.status(404).json({ error: 'Parent post not found' });
+  const result = db.prepare(
+    'INSERT INTO posts (user_id, username, color, content, reply_to) VALUES (?, ?, ?, ?, ?)'
+  ).run(user.id, user.username, user.color, content.trim(), replyTo || null);
+  if (!replyTo) trimPosts();
+  res.json({ success: true, id: result.lastInsertRowid });
+});
+
+// DELETE /api/posts/:id
+app.delete('/api/posts/:id', (req, res) => {
+  const { userId, password } = req.body;
+  const post = db.prepare('SELECT * FROM posts WHERE id = ?').get(req.params.id);
+  if (!post) return res.status(404).json({ error: 'Post not found' });
+  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(userId);
+  if (!user || user.password !== password) return res.status(401).json({ error: 'Invalid credentials' });
+  if (post.user_id !== user.id && !isMod(user)) return res.status(403).json({ error: 'Not your post' });
+  db.prepare('DELETE FROM posts WHERE id = ? OR reply_to = ?').run(post.id, post.id);
+  res.json({ success: true });
+});
+
+// POST /api/posts/:id/like — toggle like
+app.post('/api/posts/:id/like', (req, res) => {
+  const { userId, password } = req.body;
+  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(userId);
+  if (!user || user.password !== password) return res.status(401).json({ error: 'Invalid credentials' });
+  const post = db.prepare('SELECT * FROM posts WHERE id = ?').get(req.params.id);
+  if (!post) return res.status(404).json({ error: 'Post not found' });
+  const existing = db.prepare('SELECT 1 FROM post_likes WHERE user_id = ? AND post_id = ?').get(user.id, post.id);
+  if (existing) {
+    db.prepare('DELETE FROM post_likes WHERE user_id = ? AND post_id = ?').run(user.id, post.id);
+    db.prepare('UPDATE posts SET like_count = MAX(0, like_count - 1) WHERE id = ?').run(post.id);
+    res.json({ liked: false, likes: Math.max(0, post.like_count - 1) });
+  } else {
+    db.prepare('INSERT OR IGNORE INTO post_likes (user_id, post_id) VALUES (?, ?)').run(user.id, post.id);
+    db.prepare('UPDATE posts SET like_count = like_count + 1 WHERE id = ?').run(post.id);
+    res.json({ liked: true, likes: post.like_count + 1 });
+  }
+});
+
+// POST /api/follows — toggle follow
+app.post('/api/follows', (req, res) => {
+  const { userId, password, targetId } = req.body;
+  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(userId);
+  if (!user || user.password !== password) return res.status(401).json({ error: 'Invalid credentials' });
+  if (user.id === parseInt(targetId)) return res.status(400).json({ error: "Can not follow yourself" });
+  const existing = db.prepare('SELECT 1 FROM follows WHERE follower_id = ? AND following_id = ?').get(user.id, targetId);
+  if (existing) {
+    db.prepare('DELETE FROM follows WHERE follower_id = ? AND following_id = ?').run(user.id, targetId);
+    res.json({ following: false });
+  } else {
+    db.prepare('INSERT OR IGNORE INTO follows (follower_id, following_id) VALUES (?, ?)').run(user.id, targetId);
+    res.json({ following: true });
+  }
+});
+
+// GET /api/posts/feed/:userId — following feed
+app.get('/api/posts/feed/:userId', (req, res) => {
+  const { password } = req.query;
+  const me = db.prepare('SELECT * FROM users WHERE id = ?').get(req.params.userId);
+  if (!me || me.password !== password) return res.status(401).json({ error: 'Invalid credentials' });
+  const ids = db.prepare('SELECT following_id FROM follows WHERE follower_id = ?').all(me.id).map(r => r.following_id);
+  if (!ids.length) return res.json([]);
+  const ph = ids.map(() => '?').join(',');
+  const posts = db.prepare(`SELECT * FROM posts WHERE user_id IN (${ph}) AND reply_to IS NULL ORDER BY id DESC LIMIT 60`).all(...ids);
+  res.json(enrichPosts(posts, me.id));
+});
+
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => console.log(`Chat server running on port ${PORT}`));
