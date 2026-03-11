@@ -648,10 +648,14 @@ const trimPosts = db.transaction(() => {
 
 function enrichPosts(posts, viewerId) {
   if (!posts.length) return [];
-  const likedIds = viewerId
-    ? new Set(db.prepare(`SELECT post_id FROM post_likes WHERE user_id = ? AND post_id IN (${posts.map(()=>'?').join(',')})`).all(viewerId, ...posts.map(p=>p.id)).map(r=>r.post_id))
-    : new Set();
-  return posts.map(p => ({ ...p, liked: likedIds.has(p.id) }));
+  if (viewerId) {
+    const ids = posts.map(p => p.id);
+    const ph = ids.map(() => '?').join(',');
+    const rows = db.prepare(`SELECT post_id FROM post_likes WHERE user_id = ? AND post_id IN (${ph})`).all([viewerId, ...ids]);
+    const likedIds = new Set(rows.map(r => r.post_id));
+    return posts.map(p => ({ ...p, liked: likedIds.has(p.id) }));
+  }
+  return posts.map(p => ({ ...p, liked: false }));
 }
 
 // GET /api/posts — global feed
@@ -1004,10 +1008,14 @@ function parseVideoUrl(url) {
 
 function enrichVideos(videos, viewerId) {
   if (!videos.length) return [];
-  const likedIds = viewerId
-    ? new Set(db.prepare(`SELECT video_id FROM video_likes WHERE user_id = ? AND video_id IN (${videos.map(()=>'?').join(',')})`).all(viewerId, ...videos.map(v=>v.id)).map(r=>r.video_id))
-    : new Set();
-  return videos.map(v => ({ ...v, liked: likedIds.has(v.id) }));
+  if (viewerId) {
+    const ids = videos.map(v => v.id);
+    const ph = ids.map(() => '?').join(',');
+    const rows = db.prepare(`SELECT video_id FROM video_likes WHERE user_id = ? AND video_id IN (${ph})`).all([viewerId, ...ids]);
+    const likedIds = new Set(rows.map(r => r.video_id));
+    return videos.map(v => ({ ...v, liked: likedIds.has(v.id) }));
+  }
+  return videos.map(v => ({ ...v, liked: false }));
 }
 
 // GET /api/videos — list all videos newest first
