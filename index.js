@@ -913,5 +913,223 @@ app.delete('/api/boards/:code', (req, res) => {
   res.json({ success: true });
 });
 
+
+// ════════════════════════════════════════════════
+//  VIDEOS — shared video links (YouTube / Vimeo)
+// ════════════════════════════════════════════════
+const VIDEO_CAP = 200; // max videos stored total
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS videos (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    username TEXT NOT NULL DEFAULT 'Anonymous',
+    color TEXT NOT NULL DEFAULT '#e74c3c',
+    title TEXT NOT NULL DEFAULT '',
+    url TEXT NOT NULL,
+    embed_url TEXT NOT NULL,
+    provider TEXT NOT NULL DEFAULT 'youtube',
+    like_count INTEGER NOT NULL DEFAULT 0,
+    view_count INTEGER NOT NULL DEFAULT 0,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE SET NULL
+  )
+`);
+db.exec(`
+  CREATE TABLE IF NOT EXISTS video_likes (
+    user_id INTEGER NOT NULL,
+    video_id INTEGER NOT NULL,
+    PRIMARY KEY(user_id, video_id),
+    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+    FOREIGN KEY(video_id) REFERENCES videos(id) ON DELETE CASCADE
+  )
+`);
+db.exec(`
+  CREATE TABLE IF NOT EXISTS video_comments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    video_id INTEGER NOT NULL,
+    user_id INTEGER,
+    username TEXT NOT NULL,
+    color TEXT NOT NULL DEFAULT '#e74c3c',
+    content TEXT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(video_id) REFERENCES videos(id) ON DELETE CASCADE,
+    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE SET NULL
+  )
+`);
+db.exec(`CREATE INDEX IF NOT EXISTS idx_videos_id ON videos(id)`);
+db.exec(`CREATE INDEX IF NOT EXISTS idx_video_comments_vid ON video_comments(video_id)`);
+
+// Daily reset
+function resetVideos() {
+  db.prepare('DELETE FROM video_comments').run();
+  db.prepare('DELETE FROM video_likes').run();
+  db.prepare('DELETE FROM videos').run();
+  console.log(`[${new Date().toISOString()}] Daily videos reset.`);
+}
+function scheduleVideoReset() {
+  const next = new Date();
+  next.setUTCHours(0, 0, 0, 0);
+  next.setUTCDate(next.getUTCDate() + 1);
+  setTimeout(() => { resetVideos(); scheduleVideoReset(); }, next - new Date());
+}
+scheduleVideoReset();
+
+function trimVideos() {
+  const row = db.prepare('SELECT COUNT(*) as c FROM videos').get();
+  if (row.c <= VIDEO_CAP) return;
+  const excess = row.c - VIDEO_CAP;
+  const cutoff = db.prepare('SELECT id FROM videos ORDER BY id ASC LIMIT 1 OFFSET ?').get(excess);
+  if (cutoff) {
+    db.prepare('DELETE FROM video_comments WHERE video_id <= ?').run(cutoff.id);
+    db.prepare('DELETE FROM video_likes WHERE video_id <= ?').run(cutoff.id);
+    db.prepare('DELETE FROM videos WHERE id <= ?').run(cutoff.id);
+  }
+}
+
+// Parse URL -> {provider, embedUrl, videoId}
+function parseVideoUrl(url) {
+  url = url.trim();
+  // YouTube
+  let m = url.match(/(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/)([\w-]{11})/);
+  if (m) return { provider: 'youtube', videoId: m[1], embedUrl: `https://www.youtube.com/embed/${m[1]}?rel=0` };
+  // YouTube shorts
+  m = url.match(/youtube\.com\/shorts\/([\w-]{11})/);
+  if (m) return { provider: 'youtube', videoId: m[1], embedUrl: `https://www.youtube.com/embed/${m[1]}?rel=0` };
+  // Vimeo
+  m = url.match(/vimeo\.com\/(\d+)/);
+  if (m) return { provider: 'vimeo', videoId: m[1], embedUrl: `https://player.vimeo.com/video/${m[1]}` };
+  return null;
+}
+
+function enrichVideos(videos, viewerId) {
+  if (!videos.length) return [];
+  const likedIds = viewerId
+    ? new Set(db.prepare(`SELECT video_id FROM video_likes WHERE user_id = ? AND video_id IN (${videos.map(()=>'?').join(',')})`).all(viewerId, ...videos.map(v=>v.id)).map(r=>r.video_id))
+    : new Set();
+  return videos.map(v => ({ ...v, liked: likedIds.has(v.id) }));
+}
+
+// GET /api/videos — list all videos newest first
+app.get('/api/videos', (req, res) => {
+  const viewerId = parseInt(req.query.userId) || null;
+  const before = parseInt(req.query.before) || null;
+  const limit = Math.min(parseInt(req.query.limit) || 24, 60);
+  const videos = before
+    ? db.prepare('SELECT * FROM videos WHERE id < ? ORDER BY id DESC LIMIT ?').all(before, limit)
+    : db.prepare('SELECT * FROM videos ORDER BY id DESC LIMIT ?').all(limit);
+  res.json(enrichVideos(videos, viewerId));
+});
+
+// GET /api/videos/top — most liked
+app.get('/api/videos/top', (req, res) => {
+  const viewerId = parseInt(req.query.userId) || null;
+  const videos = db.prepare('SELECT * FROM videos ORDER BY like_count DESC, id DESC LIMIT 24').all();
+  res.json(enrichVideos(videos, viewerId));
+});
+
+// GET /api/videos/:id — single video + comments
+app.get('/api/videos/:id', (req, res) => {
+  const viewerId = parseInt(req.query.userId) || null;
+  const video = db.prepare('SELECT * FROM videos WHERE id = ?').get(req.params.id);
+  if (!video) return res.status(404).json({ error: 'Video not found' });
+  db.prepare('UPDATE videos SET view_count = view_count + 1 WHERE id = ?').run(video.id);
+  const comments = db.prepare('SELECT * FROM video_comments WHERE video_id = ? ORDER BY id ASC LIMIT 100').all(video.id);
+  res.json({ video: enrichVideos([video], viewerId)[0], comments });
+});
+
+// POST /api/videos — submit a video
+app.post('/api/videos', (req, res) => {
+  const { userId, password, url, title } = req.body;
+  if (!url) return res.status(400).json({ error: 'URL required' });
+  const parsed = parseVideoUrl(url);
+  if (!parsed) return res.status(400).json({ error: 'Only YouTube and Vimeo URLs are supported' });
+  let username = 'Anonymous', userColor = '#e74c3c', finalUserId = null;
+  if (userId && password) {
+    const user = db.prepare('SELECT * FROM users WHERE id = ?').get(userId);
+    if (!user || user.password !== password) return res.status(401).json({ error: 'Invalid credentials' });
+    if (user.banned) return res.status(403).json({ error: 'You are banned' });
+    username = user.username; userColor = user.color; finalUserId = user.id;
+  }
+  const finalTitle = (title || '').trim().slice(0, 100) || 'Untitled';
+  const result = db.prepare(
+    'INSERT INTO videos (user_id, username, color, title, url, embed_url, provider) VALUES (?, ?, ?, ?, ?, ?, ?)'
+  ).run(finalUserId, username, userColor, finalTitle, url.trim(), parsed.embedUrl, parsed.provider);
+  trimVideos();
+  res.json({ success: true, id: result.lastInsertRowid });
+});
+
+// DELETE /api/videos/:id
+app.delete('/api/videos/:id', (req, res) => {
+  const { userId, password } = req.body;
+  const video = db.prepare('SELECT * FROM videos WHERE id = ?').get(req.params.id);
+  if (!video) return res.status(404).json({ error: 'Video not found' });
+  if (userId && password) {
+    const user = db.prepare('SELECT * FROM users WHERE id = ?').get(userId);
+    if (!user || user.password !== password) return res.status(401).json({ error: 'Invalid credentials' });
+    if (video.user_id !== user.id && !isMod(user)) return res.status(403).json({ error: 'Not your video' });
+  } else {
+    return res.status(401).json({ error: 'Login required to delete' });
+  }
+  db.prepare('DELETE FROM video_comments WHERE video_id = ?').run(video.id);
+  db.prepare('DELETE FROM video_likes WHERE video_id = ?').run(video.id);
+  db.prepare('DELETE FROM videos WHERE id = ?').run(video.id);
+  res.json({ success: true });
+});
+
+// POST /api/videos/:id/like — toggle like (auth required)
+app.post('/api/videos/:id/like', (req, res) => {
+  const { userId, password } = req.body;
+  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(userId);
+  if (!user || user.password !== password) return res.status(401).json({ error: 'Invalid credentials' });
+  const video = db.prepare('SELECT * FROM videos WHERE id = ?').get(req.params.id);
+  if (!video) return res.status(404).json({ error: 'Video not found' });
+  const existing = db.prepare('SELECT 1 FROM video_likes WHERE user_id = ? AND video_id = ?').get(user.id, video.id);
+  if (existing) {
+    db.prepare('DELETE FROM video_likes WHERE user_id = ? AND video_id = ?').run(user.id, video.id);
+    db.prepare('UPDATE videos SET like_count = MAX(0, like_count - 1) WHERE id = ?').run(video.id);
+    res.json({ liked: false, likes: Math.max(0, video.like_count - 1) });
+  } else {
+    db.prepare('INSERT OR IGNORE INTO video_likes (user_id, video_id) VALUES (?, ?)').run(user.id, video.id);
+    db.prepare('UPDATE videos SET like_count = like_count + 1 WHERE id = ?').run(video.id);
+    res.json({ liked: true, likes: video.like_count + 1 });
+  }
+});
+
+// POST /api/videos/:id/comments
+app.post('/api/videos/:id/comments', (req, res) => {
+  const { userId, password, content } = req.body;
+  if (!content || !content.trim()) return res.status(400).json({ error: 'Comment required' });
+  if (content.length > 500) return res.status(400).json({ error: 'Max 500 chars' });
+  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(userId);
+  if (!user || user.password !== password) return res.status(401).json({ error: 'Invalid credentials' });
+  if (user.banned) return res.status(403).json({ error: 'You are banned' });
+  if (user.muted) return res.status(403).json({ error: 'You are muted' });
+  const video = db.prepare('SELECT * FROM videos WHERE id = ?').get(req.params.id);
+  if (!video) return res.status(404).json({ error: 'Video not found' });
+  const result = db.prepare(
+    'INSERT INTO video_comments (video_id, user_id, username, color, content) VALUES (?, ?, ?, ?, ?)'
+  ).run(video.id, user.id, user.username, user.color, content.trim());
+  // Trim comments per video to 100
+  const ccount = db.prepare('SELECT COUNT(*) as c FROM video_comments WHERE video_id = ?').get(video.id).c;
+  if (ccount > 100) {
+    const cutoff = db.prepare('SELECT id FROM video_comments WHERE video_id = ? ORDER BY id ASC LIMIT 1').get(video.id);
+    if (cutoff) db.prepare('DELETE FROM video_comments WHERE id = ?').run(cutoff.id);
+  }
+  res.json({ success: true, id: result.lastInsertRowid });
+});
+
+// DELETE /api/videos/:id/comments/:cid
+app.delete('/api/videos/:id/comments/:cid', (req, res) => {
+  const { userId, password } = req.body;
+  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(userId);
+  if (!user || user.password !== password) return res.status(401).json({ error: 'Invalid credentials' });
+  const comment = db.prepare('SELECT * FROM video_comments WHERE id = ?').get(req.params.cid);
+  if (!comment) return res.status(404).json({ error: 'Comment not found' });
+  if (comment.user_id !== user.id && !isMod(user)) return res.status(403).json({ error: 'Not your comment' });
+  db.prepare('DELETE FROM video_comments WHERE id = ?').run(comment.id);
+  res.json({ success: true });
+});
+
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => console.log(`Chat server running on port ${PORT}`));
