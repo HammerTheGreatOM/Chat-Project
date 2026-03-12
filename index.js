@@ -507,7 +507,37 @@ app.get('/api/users', (req, res) => {
   res.json(db.prepare('SELECT id, username, color FROM users WHERE banned = 0 ORDER BY username ASC COLLATE NOCASE').all());
 });
 
-// GET /api/dm/:myId/:theirId — fetch conversation  { myPassword required as query param }
+// GET /api/dm/:myId/inbox — MUST be before /:myId/:theirId to avoid route conflict
+app.get('/api/dm/:myId/inbox', (req, res) => {
+  const { password } = req.query;
+  const me = db.prepare('SELECT * FROM users WHERE id = ?').get(req.params.myId);
+  if (!me || me.password !== password) return res.status(401).json({ error: 'Invalid credentials' });
+  const myId = me.id;
+  // Find all distinct convo_keys that contain this user's id
+  // convo_key format is always "smallerId_largerId"
+  const rows = db.prepare(`
+    SELECT convo_key, MAX(id) as last_id
+    FROM dms
+    WHERE convo_key LIKE (? || '_%') OR convo_key LIKE ('%_' || ?)
+    GROUP BY convo_key
+    ORDER BY last_id DESC
+  `).all(String(myId), String(myId));
+
+  const convos = [];
+  for (const row of rows) {
+    const parts = row.convo_key.split('_');
+    if (parts.length !== 2) continue;
+    const [a, b] = parts.map(Number);
+    if (a !== myId && b !== myId) continue;
+    const partnerId = a === myId ? b : a;
+    const partner = db.prepare('SELECT id, username, color FROM users WHERE id = ?').get(partnerId);
+    const last = db.prepare('SELECT content, sender_name, created_at FROM dms WHERE convo_key = ? ORDER BY id DESC LIMIT 1').get(row.convo_key);
+    if (partner) convos.push({ convo_key: row.convo_key, partner, last });
+  }
+  res.json(convos);
+});
+
+// GET /api/dm/:myId/:theirId — fetch conversation
 app.get('/api/dm/:myId/:theirId', (req, res) => {
   const { password } = req.query;
   const me = db.prepare('SELECT * FROM users WHERE id = ?').get(req.params.myId);
@@ -543,42 +573,6 @@ app.post('/api/dm/:myId/:theirId', (req, res) => {
   logIp(ip, me.id, me.username, 'dm');
   trimDm(key);
   res.json({ success: true, id: result.lastInsertRowid });
-});
-
-// GET /api/dm/:myId/inbox — list all convos the user has participated in (for sidebar)
-app.get('/api/dm/:myId/inbox', (req, res) => {
-  const { password } = req.query;
-  const me = db.prepare('SELECT * FROM users WHERE id = ?').get(req.params.myId);
-  if (!me || me.password !== password) return res.status(401).json({ error: 'Invalid credentials' });
-  // Find all convo_keys involving this user — key format is "smallerId_largerId"
-  const myId = me.id;
-  const rows = db.prepare(`
-    SELECT d.convo_key,
-      MAX(d.id) as last_id,
-      MAX(d.created_at) as last_at
-    FROM dms d
-    WHERE d.convo_key = (CAST(? AS TEXT) || '_' || CAST(d.sender_id AS TEXT))
-       OR d.convo_key = (CAST(d.sender_id AS TEXT) || '_' || CAST(? AS TEXT))
-       OR d.sender_id = ?
-    GROUP BY d.convo_key
-    ORDER BY last_id DESC
-  `).all(myId, myId, myId);
-
-  // Deduplicate and resolve partner for each convo
-  const seen = new Set();
-  const convos = [];
-  for (const row of rows) {
-    if (seen.has(row.convo_key)) continue;
-    seen.add(row.convo_key);
-    const [a, b] = row.convo_key.split('_').map(Number);
-    if (a !== myId && b !== myId) continue; // safety check
-    const partnerId = a === myId ? b : a;
-    const partner = db.prepare('SELECT id, username, color FROM users WHERE id = ?').get(partnerId);
-    const last = db.prepare('SELECT content, sender_name, created_at FROM dms WHERE convo_key = ? ORDER BY id DESC LIMIT 1').get(row.convo_key);
-    if (partner) convos.push({ convo_key: row.convo_key, partner, last });
-  }
-
-  res.json(convos);
 });
 
 
