@@ -504,7 +504,7 @@ scheduleDmReset();
 
 // GET /api/users — list all users (for contacts list), no passwords exposed
 app.get('/api/users', (req, res) => {
-  res.json(db.prepare('SELECT id, username, color FROM users WHERE banned = 0 ORDER BY username ASC COLLATE NOCASE').all());
+  res.json(db.prepare('SELECT id, username, color FROM users WHERE banned = 0 ORDER BY username COLLATE NOCASE ASC').all());
 });
 
 // GET /api/dm/:myId/inbox — MUST be before /:myId/:theirId to avoid route conflict
@@ -515,13 +515,25 @@ app.get('/api/dm/:myId/inbox', (req, res) => {
   const myId = me.id;
   // Find all distinct convo_keys that contain this user's id
   // convo_key format is always "smallerId_largerId"
-  const rows = db.prepare(`
-    SELECT convo_key, MAX(id) as last_id
-    FROM dms
-    WHERE convo_key LIKE (? || '_%') OR convo_key LIKE ('%_' || ?)
-    GROUP BY convo_key
-    ORDER BY last_id DESC
-  `).all(String(myId), String(myId));
+  // Get all convo_keys this user participated in (as sender)
+  // Then also get any where they are the recipient by checking key components
+  const sentRows = db.prepare(
+    'SELECT DISTINCT convo_key FROM dms WHERE sender_id = ?'
+  ).all(myId).map(r => r.convo_key);
+
+  // Get all convo_keys and filter to ones containing myId as a component
+  const allKeys = db.prepare('SELECT DISTINCT convo_key FROM dms').all().map(r => r.convo_key);
+  const myIdStr = String(myId);
+  const relevantKeys = [...new Set([...sentRows, ...allKeys.filter(k => {
+    const parts = k.split('_');
+    return parts.length === 2 && (parts[0] === myIdStr || parts[1] === myIdStr);
+  })])];
+
+  // Get last message for each key
+  const rows = relevantKeys.map(key => {
+    const last = db.prepare('SELECT id FROM dms WHERE convo_key = ? ORDER BY id DESC LIMIT 1').get(key);
+    return { convo_key: key, last_id: last ? last.id : 0 };
+  }).sort((a, b) => b.last_id - a.last_id);
 
   const convos = [];
   for (const row of rows) {
