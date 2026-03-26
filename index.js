@@ -363,18 +363,22 @@ app.post('/api/rooms/:id/messages', (req, res) => {
     return res.status(403).json({ error: 'Wrong room password' });
   }
 
-  // Whitelist check
-  if (!isMaster(password) && !isUserWhitelisted(user.id, roomId) && !isRoomCreator(user.id, roomId)) {
-    return res.status(403).json({ error: 'You are not whitelisted in this room' });
+  const trimmed = content.trim();
+  const isCommand = trimmed.startsWith('/');
+  const isCreatorSending = isRoomCreator(user.id, roomId);
+  const isMasterSending = isMaster(password);
+  const isModSending = user.is_mod === 1;
+
+  // Commands bypass whitelist/mute so creators/mods can always manage their room
+  if (!isCommand) {
+    if (!isMasterSending && !isModSending && !isCreatorSending && !isUserWhitelisted(user.id, roomId)) {
+      return res.status(403).json({ error: 'You are not whitelisted in this room' });
+    }
+    if (isUserMutedInRoom(user.id, roomId)) return res.status(403).json({ error: 'You are muted in this room' });
   }
 
-  // Mute check (room-specific or global)
-  if (isUserMutedInRoom(user.id, roomId)) return res.status(403).json({ error: 'You are muted in this room' });
-
-  // ── Command handling ────────────────────────────────────────────────────────
-  const trimmed = content.trim();
-  if (trimmed.startsWith('/')) {
-    return handleCommand(req, res, user, room, trimmed, roomPassword);
+  if (isCommand) {
+    return handleCommand(req, res, user, room, trimmed, password, roomPassword);
   }
 
   db.prepare('INSERT INTO messages (room_id, user_id, username, color, content) VALUES (?, ?, ?, ?, ?)').run(roomId, user.id, user.username, user.color, trimmed);
@@ -394,12 +398,12 @@ function parseArgs(str) {
   return args; // args[0] = command, args[1..] = params
 }
 
-function handleCommand(req, res, user, room, content, roomPassword) {
+function handleCommand(req, res, user, room, content, password, roomPassword) {
   const args = parseArgs(content);
   const cmd = args[0].toLowerCase();
   const isCreator = isRoomCreator(user.id, room.id);
   const isMod = user.is_mod === 1;
-  const isMasterUser = isMaster(user.password) || isMaster(roomPassword);
+  const isMasterUser = isMaster(password); // 'password' is the raw password sent in the request
 
   // Helper to check if caller has permission for a command
   function canMod() { return isMod || isMasterUser; }
@@ -867,6 +871,7 @@ app.post('/api/mod/rooms/:id/server-message', (req, res) => {
   const { message } = req.body;
   const room = db.prepare('SELECT * FROM rooms WHERE id = ?').get(req.params.id);
   if (!room) return res.status(404).json({ error: 'Room not found' });
+  // General room IS allowed to have its server_message changed via mod panel
   db.prepare('UPDATE rooms SET server_message = ? WHERE id = ?').run(message || '', room.id);
   modLog('set_server_msg', room.name, (message || '').slice(0, 60));
   res.json({ success: true });
