@@ -25,7 +25,14 @@ function isMaster(pw) { return pw === config.masterPassword; }
 // ════════════════════════════════════════════════════════════
 
 const db = new Database('chat.db');
-app.use(cors());
+
+// Explicit CORS — allow all origins so file:// and any hosted domain works
+app.use(cors({
+  origin: '*',
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+}));
+app.options('*', cors());
 app.use(express.json());
 
 // Trust proxy for real IPs (works on Render/Railway)
@@ -723,6 +730,13 @@ app.post('/api/dm/:userId/:partnerId', (req, res) => {
 });
 
 // ── Mod API ───────────────────────────────────────────────────────────────────
+
+// ── Mod login (POST so it works from file:// without CORS query-string issues) ─
+app.post('/api/mod/login', (req, res) => {
+  const { password } = req.body;
+  if (!isMaster(password)) return res.status(403).json({ error: 'Wrong password' });
+  res.json({ success: true });
+});
 
 function checkMod(req, res) {
   const pw = req.query.password || req.body?.password;
