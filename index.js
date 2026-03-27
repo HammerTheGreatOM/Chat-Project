@@ -6,6 +6,9 @@ const path = require('path');
 
 const app = express();
 
+// Serve Chat.html and Chat_Moderation.html from /public folder
+app.use(express.static(path.join(__dirname, 'public')));
+
 // ════════════════════════════════════════════════════════════
 //  ★ EDITABLE CONFIG — also changeable at runtime via mod panel
 // ════════════════════════════════════════════════════════════
