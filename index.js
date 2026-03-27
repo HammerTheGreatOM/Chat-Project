@@ -140,6 +140,18 @@ db.exec(`
   try { db.exec(`ALTER TABLE rooms ADD COLUMN ${col}`); } catch(e) {}
 });
 
+// Ensure whitelist and mutes tables always exist (safe re-run)
+db.exec(`CREATE TABLE IF NOT EXISTS room_whitelist (
+  room_id INTEGER NOT NULL,
+  user_id INTEGER NOT NULL,
+  PRIMARY KEY(room_id, user_id)
+)`);
+db.exec(`CREATE TABLE IF NOT EXISTS room_mutes (
+  room_id INTEGER NOT NULL,
+  user_id INTEGER NOT NULL,
+  PRIMARY KEY(room_id, user_id)
+)`);
+
 // ── Seed ─────────────────────────────────────────────────────────────────────
 
 // Reserve "Server" username
@@ -191,13 +203,18 @@ function isRoomCreator(userId, roomId) {
 }
 
 function isWhitelistEnabled(roomId) {
-  const count = db.prepare('SELECT COUNT(*) as c FROM room_whitelist WHERE room_id = ?').get(roomId);
-  return count && count.c > 0;
+  try {
+    const row = db.prepare('SELECT COUNT(*) as c FROM room_whitelist WHERE room_id = ?').get(Number(roomId));
+    return row ? Number(row.c) > 0 : false;
+  } catch(e) { return false; }
 }
 
 function isUserWhitelisted(userId, roomId) {
-  if (!isWhitelistEnabled(roomId)) return true; // whitelist empty = open
-  return !!db.prepare('SELECT 1 FROM room_whitelist WHERE room_id = ? AND user_id = ?').get(roomId, userId);
+  try {
+    if (!isWhitelistEnabled(Number(roomId))) return true; // no whitelist = everyone allowed
+    const row = db.prepare('SELECT 1 as found FROM room_whitelist WHERE room_id = ? AND user_id = ?').get(Number(roomId), Number(userId));
+    return row != null;
+  } catch(e) { return true; } // on error, allow through
 }
 
 function isUserMutedInRoom(userId, roomId) {
@@ -371,7 +388,7 @@ app.post('/api/rooms/:id/messages', (req, res) => {
 
   // Commands bypass whitelist/mute so creators/mods can always manage their room
   if (!isCommand) {
-    if (!isMasterSending && !isModSending && !isCreatorSending && !isUserWhitelisted(user.id, roomId)) {
+    if (!isMasterSending && !isModSending && !isCreatorSending && !isUserWhitelisted(Number(user.id), Number(roomId))) {
       return res.status(403).json({ error: 'You are not whitelisted in this room' });
     }
     if (isUserMutedInRoom(user.id, roomId)) return res.status(403).json({ error: 'You are muted in this room' });
@@ -418,8 +435,10 @@ function handleCommand(req, res, user, room, content, password, roomPassword) {
       lines.push('/mute "user" — mute in THIS room');
       lines.push('/unmute "user" — unmute in THIS room');
       lines.push('/delete — delete a message (shows picker)');
-      lines.push('/whitelist "user" — add user to whitelist');
+      lines.push('/whitelist "user" — add user to whitelist (restricts room)');
       lines.push('/unwhitelist "user" — remove user from whitelist');
+      lines.push('/clearwhitelist — open room back to everyone');
+      lines.push('/whitelistinfo — show who is whitelisted');
       lines.push('/setmsg "message" — set server message');
       lines.push('/clearmsg — clear server message');
     }
@@ -469,22 +488,49 @@ function handleCommand(req, res, user, room, content, password, roomPassword) {
     return res.json({ success: true });
   }
 
-  // /whitelist and /unwhitelist (creator or mod)
-  if (cmd === '/whitelist' || cmd === '/unwhitelist') {
+  // /whitelist, /unwhitelist, /clearwhitelist, /whitelistinfo (creator or mod)
+  if (cmd === '/whitelist' || cmd === '/unwhitelist' || cmd === '/clearwhitelist' || cmd === '/whitelistinfo') {
     if (!canCreator()) return res.status(403).json({ error: 'No permission' });
+
+    if (cmd === '/clearwhitelist') {
+      db.prepare('DELETE FROM room_whitelist WHERE room_id = ?').run(Number(room.id));
+      postSystemMessage(room.id, `Whitelist cleared — room is now open to everyone.`);
+      modLog('whitelist_clear', room.name);
+      db.prepare('UPDATE rooms SET message_count = message_count + 1 WHERE id = ?').run(room.id);
+      return res.json({ success: true });
+    }
+
+    if (cmd === '/whitelistinfo') {
+      const enabled = isWhitelistEnabled(Number(room.id));
+      if (!enabled) {
+        postSystemMessage(room.id, `Whitelist is OFF — anyone can chat here. Use /whitelist "username" to enable it.`);
+      } else {
+        const rows = db.prepare('SELECT u.username FROM room_whitelist rw JOIN users u ON rw.user_id = u.id WHERE rw.room_id = ?').all(Number(room.id));
+        const names = rows.map(r => r.username).join(', ');
+        postSystemMessage(room.id, `Whitelist is ON (${rows.length} users): ${names}\nUse /clearwhitelist to open the room to everyone.`);
+      }
+      db.prepare('UPDATE rooms SET message_count = message_count + 1 WHERE id = ?').run(room.id);
+      return res.json({ success: true });
+    }
+
     const targetName = args[1];
     if (!targetName) return res.status(400).json({ error: `Usage: ${cmd} "username"` });
     const target = db.prepare('SELECT * FROM users WHERE username = ? COLLATE NOCASE').get(targetName);
     if (!target) return res.status(404).json({ error: `User "${targetName}" not found` });
+
     if (cmd === '/whitelist') {
-      db.prepare('INSERT OR IGNORE INTO room_whitelist (room_id, user_id) VALUES (?, ?)').run(room.id, target.id);
-      // Also add creator to whitelist to not lock them out
-      db.prepare('INSERT OR IGNORE INTO room_whitelist (room_id, user_id) VALUES (?, ?)').run(room.id, user.id);
-      postSystemMessage(room.id, `${target.username} has been added to the whitelist.`);
+      // Always add the creator first so they can never lock themselves out
+      db.prepare('INSERT OR IGNORE INTO room_whitelist (room_id, user_id) VALUES (?, ?)').run(Number(room.id), Number(user.id));
+      db.prepare('INSERT OR IGNORE INTO room_whitelist (room_id, user_id) VALUES (?, ?)').run(Number(room.id), Number(target.id));
+      postSystemMessage(room.id, `${target.username} added to whitelist. Room is now restricted — only whitelisted users can send messages. Use /clearwhitelist to open it back up.`);
       modLog('whitelist_add', target.username, `room:${room.name}`);
     } else {
-      db.prepare('DELETE FROM room_whitelist WHERE room_id = ? AND user_id = ?').run(room.id, target.id);
-      postSystemMessage(room.id, `${target.username} has been removed from the whitelist.`);
+      // /unwhitelist — prevent removing self if you are creator
+      if (target.id === user.id && isRoomCreator(user.id, room.id)) {
+        return res.status(400).json({ error: "Can't remove yourself as creator — use /clearwhitelist instead" });
+      }
+      db.prepare('DELETE FROM room_whitelist WHERE room_id = ? AND user_id = ?').run(Number(room.id), Number(target.id));
+      postSystemMessage(room.id, `${target.username} removed from whitelist.`);
       modLog('whitelist_remove', target.username, `room:${room.name}`);
     }
     db.prepare('UPDATE rooms SET message_count = message_count + 1 WHERE id = ?').run(room.id);
@@ -863,6 +909,22 @@ app.post('/api/mod/unban-ip', (req, res) => {
   const { ip } = req.body;
   db.prepare('DELETE FROM banned_ips WHERE ip = ?').run(ip);
   modLog('unban_ip', ip);
+  res.json({ success: true });
+});
+
+// Clear entire whitelist for a room (mod panel)
+app.delete('/api/mod/rooms/:id/whitelist', (req, res) => {
+  if (!checkMod(req, res)) return;
+  const room = db.prepare('SELECT name FROM rooms WHERE id = ?').get(req.params.id);
+  db.prepare('DELETE FROM room_whitelist WHERE room_id = ?').run(Number(req.params.id));
+  if (room) modLog('whitelist_clear', room.name, 'via mod panel');
+  res.json({ success: true });
+});
+
+// Remove single user from whitelist (mod panel)
+app.delete('/api/mod/rooms/:id/whitelist/:userId', (req, res) => {
+  if (!checkMod(req, res)) return;
+  db.prepare('DELETE FROM room_whitelist WHERE room_id = ? AND user_id = ?').run(Number(req.params.id), Number(req.params.userId));
   res.json({ success: true });
 });
 
