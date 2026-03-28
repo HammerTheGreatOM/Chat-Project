@@ -1,248 +1,197 @@
 const express = require('express');
 const cors = require('cors');
 const { Pool } = require('pg');
-const fs = require('fs');
-const path = require('path');
 
 const app = express();
 
-// Serve Chat.html and Chat_Moderation.html from /public folder
-app.use(express.static(path.join(__dirname, 'public')));
-
 // ════════════════════════════════════════════════════════════
-//  ★ EDITABLE CONFIG — also changeable at runtime via mod panel
+//  ★ EDITABLE CONFIG
 // ════════════════════════════════════════════════════════════
-const CONFIG_FILE = path.join(__dirname, 'config.json');
-function loadConfig() {
-  try { return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')); } catch(e) {}
-  return { masterPassword: '582624' };
-}
-function saveConfig(cfg) {
-  fs.writeFileSync(CONFIG_FILE, JSON.stringify(cfg, null, 2));
-}
-let config = loadConfig();
-function isMaster(pw) { return pw === config.masterPassword; }
+let MASTER_PASSWORD = process.env.MASTER_PASSWORD || '582624';
 // ════════════════════════════════════════════════════════════
 
-const db = new Database('chat.db');
-
-// Explicit CORS — allow all origins so file:// and any hosted domain works
-app.use(cors({
-  origin: '*',
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
-}));
-app.options('*', cors());
+app.use(cors());
 app.use(express.json());
-
-// Trust proxy for real IPs (works on Render/Railway)
 app.set('trust proxy', true);
+
+// ── Database ──────────────────────────────────────────────────────────────────
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+});
+
+async function q(sql, params = []) {
+  const res = await pool.query(sql, params);
+  return res.rows;
+}
+async function q1(sql, params = []) {
+  const res = await pool.query(sql, params);
+  return res.rows[0] || null;
+}
 
 // ── Schema ────────────────────────────────────────────────────────────────────
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT NOT NULL UNIQUE COLLATE NOCASE,
-    password TEXT NOT NULL,
-    color TEXT NOT NULL DEFAULT '#44aaff',
-    is_mod INTEGER NOT NULL DEFAULT 0,
-    muted INTEGER NOT NULL DEFAULT 0,
-    banned INTEGER NOT NULL DEFAULT 0,
-    ban_reason TEXT DEFAULT '',
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  )
-`);
+async function initDb() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id SERIAL PRIMARY KEY,
+      username TEXT NOT NULL UNIQUE,
+      password TEXT NOT NULL,
+      color TEXT NOT NULL DEFAULT '#44aaff',
+      is_mod INTEGER NOT NULL DEFAULT 0,
+      banned INTEGER NOT NULL DEFAULT 0,
+      ban_reason TEXT DEFAULT '',
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS rooms (
+      id SERIAL PRIMARY KEY,
+      name TEXT NOT NULL UNIQUE,
+      description TEXT DEFAULT '',
+      creator_id INTEGER REFERENCES users(id),
+      password TEXT,
+      is_private INTEGER NOT NULL DEFAULT 0,
+      is_general INTEGER NOT NULL DEFAULT 0,
+      message_count INTEGER NOT NULL DEFAULT 0,
+      server_message TEXT DEFAULT '',
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS messages (
+      id SERIAL PRIMARY KEY,
+      room_id INTEGER NOT NULL REFERENCES rooms(id),
+      user_id INTEGER NOT NULL REFERENCES users(id),
+      username TEXT NOT NULL,
+      color TEXT NOT NULL DEFAULT '#44aaff',
+      content TEXT NOT NULL,
+      is_system INTEGER NOT NULL DEFAULT 0,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS direct_messages (
+      id SERIAL PRIMARY KEY,
+      sender_id INTEGER NOT NULL REFERENCES users(id),
+      receiver_id INTEGER NOT NULL REFERENCES users(id),
+      content TEXT NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS room_whitelist (
+      room_id INTEGER NOT NULL REFERENCES rooms(id),
+      user_id INTEGER NOT NULL REFERENCES users(id),
+      PRIMARY KEY (room_id, user_id)
+    )
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS room_mutes (
+      room_id INTEGER NOT NULL,
+      user_id INTEGER NOT NULL REFERENCES users(id),
+      PRIMARY KEY (room_id, user_id)
+    )
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS ip_log (
+      id SERIAL PRIMARY KEY,
+      ip TEXT NOT NULL,
+      user_id INTEGER,
+      event TEXT DEFAULT 'login',
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS banned_ips (
+      ip TEXT PRIMARY KEY,
+      reason TEXT DEFAULT '',
+      banned_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS mod_log (
+      id SERIAL PRIMARY KEY,
+      action TEXT NOT NULL,
+      target TEXT NOT NULL,
+      detail TEXT DEFAULT '',
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS rooms (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL UNIQUE COLLATE NOCASE,
-    description TEXT DEFAULT '',
-    creator_id INTEGER,
-    password TEXT,
-    is_private INTEGER NOT NULL DEFAULT 0,
-    is_general INTEGER NOT NULL DEFAULT 0,
-    message_count INTEGER NOT NULL DEFAULT 0,
-    server_message TEXT DEFAULT '',
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY(creator_id) REFERENCES users(id)
-  )
-`);
+  // Seed Server user
+  const serverUser = await q1(`SELECT id FROM users WHERE LOWER(username) = 'server'`);
+  if (!serverUser) {
+    await pool.query(`INSERT INTO users (username, password, color, is_mod) VALUES ('Server', '__server__', '#7c6dfa', 1)`);
+  }
+  // Seed General room
+  const general = await q1(`SELECT id FROM rooms WHERE is_general = 1`);
+  if (!general) {
+    await pool.query(`INSERT INTO rooms (name, description, is_general, is_private) VALUES ('General', 'The main chat. Always here.', 1, 0)`);
+  }
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS messages (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    room_id INTEGER NOT NULL,
-    user_id INTEGER NOT NULL,
-    username TEXT NOT NULL,
-    color TEXT NOT NULL DEFAULT '#44aaff',
-    content TEXT NOT NULL,
-    is_system INTEGER NOT NULL DEFAULT 0,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY(room_id) REFERENCES rooms(id),
-    FOREIGN KEY(user_id) REFERENCES users(id)
-  )
-`);
-
-db.exec(`
-  CREATE TABLE IF NOT EXISTS direct_messages (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    sender_id INTEGER NOT NULL,
-    receiver_id INTEGER NOT NULL,
-    content TEXT NOT NULL,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY(sender_id) REFERENCES users(id),
-    FOREIGN KEY(receiver_id) REFERENCES users(id)
-  )
-`);
-
-// Whitelist: per-room list of allowed users (if empty, all allowed)
-db.exec(`
-  CREATE TABLE IF NOT EXISTS room_whitelist (
-    room_id INTEGER NOT NULL,
-    user_id INTEGER NOT NULL,
-    PRIMARY KEY(room_id, user_id),
-    FOREIGN KEY(room_id) REFERENCES rooms(id),
-    FOREIGN KEY(user_id) REFERENCES users(id)
-  )
-`);
-
-// Per-room mutes (room_id=0 means global mute)
-db.exec(`
-  CREATE TABLE IF NOT EXISTS room_mutes (
-    room_id INTEGER NOT NULL,
-    user_id INTEGER NOT NULL,
-    PRIMARY KEY(room_id, user_id)
-  )
-`);
-
-db.exec(`
-  CREATE TABLE IF NOT EXISTS ip_log (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    ip TEXT NOT NULL,
-    user_id INTEGER,
-    event TEXT DEFAULT 'login',
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  )
-`);
-
-db.exec(`
-  CREATE TABLE IF NOT EXISTS banned_ips (
-    ip TEXT PRIMARY KEY,
-    reason TEXT DEFAULT '',
-    banned_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  )
-`);
-
-db.exec(`
-  CREATE TABLE IF NOT EXISTS mod_log (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    action TEXT NOT NULL,
-    target TEXT NOT NULL,
-    detail TEXT DEFAULT '',
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  )
-`);
-
-// Migrations for existing DBs
-['server_message TEXT DEFAULT ""'].forEach(col => {
-  try { db.exec(`ALTER TABLE rooms ADD COLUMN ${col}`); } catch(e) {}
-});
-
-// Ensure whitelist and mutes tables always exist (safe re-run)
-db.exec(`CREATE TABLE IF NOT EXISTS room_whitelist (
-  room_id INTEGER NOT NULL,
-  user_id INTEGER NOT NULL,
-  PRIMARY KEY(room_id, user_id)
-)`);
-db.exec(`CREATE TABLE IF NOT EXISTS room_mutes (
-  room_id INTEGER NOT NULL,
-  user_id INTEGER NOT NULL,
-  PRIMARY KEY(room_id, user_id)
-)`);
-
-// ── Seed ─────────────────────────────────────────────────────────────────────
-
-// Reserve "Server" username
-const serverUser = db.prepare("SELECT id FROM users WHERE username = 'Server' COLLATE NOCASE").get();
-if (!serverUser) {
-  db.prepare("INSERT INTO users (username, password, color, is_mod) VALUES ('Server', '__server__', '#7c6dfa', 1)").run();
-}
-
-const existing = db.prepare('SELECT id FROM rooms WHERE is_general = 1').get();
-if (!existing) {
-  db.prepare(`INSERT INTO rooms (name, description, is_general, is_private) VALUES ('General', 'The main chat. Always here.', 1, 0)`).run();
+  console.log('Database ready.');
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-function getClientIp(req) {
-  // Use req.ip which respects 'trust proxy' setting — gives real client IP
-  return req.ip || 'unknown';
-}
+function isMaster(pw) { return pw === MASTER_PASSWORD; }
+function getClientIp(req) { return req.ip || 'unknown'; }
 
-function logIp(req, userId, event = 'action') {
+async function logIp(req, userId, event = 'action') {
   try {
     const ip = getClientIp(req);
-    db.prepare('INSERT INTO ip_log (ip, user_id, event) VALUES (?, ?, ?)').run(ip, userId, event);
-    return ip;
-  } catch(e) { return 'unknown'; }
+    await pool.query('INSERT INTO ip_log (ip, user_id, event) VALUES ($1, $2, $3)', [ip, userId, event]);
+  } catch(e) {}
 }
 
-function isIpBanned(req) {
+async function isIpBanned(req) {
   const ip = getClientIp(req);
-  return !!db.prepare('SELECT ip FROM banned_ips WHERE ip = ?').get(ip);
+  return !!(await q1('SELECT ip FROM banned_ips WHERE ip = $1', [ip]));
 }
 
-function modLog(action, target, detail = '') {
-  db.prepare('INSERT INTO mod_log (action, target, detail) VALUES (?, ?, ?)').run(action, target, detail);
+async function modLog(action, target, detail = '') {
+  await pool.query('INSERT INTO mod_log (action, target, detail) VALUES ($1, $2, $3)', [action, target, detail]);
 }
 
-function getUser(username, password) {
-  return db.prepare('SELECT * FROM users WHERE username = ? COLLATE NOCASE AND password = ?').get(username, password);
+async function getUser(username, password) {
+  return q1('SELECT * FROM users WHERE LOWER(username) = LOWER($1) AND password = $2', [username, password]);
 }
 
-function getUserById(id) {
-  return db.prepare('SELECT * FROM users WHERE id = ?').get(id);
+async function isRoomCreator(userId, roomId) {
+  const room = await q1('SELECT creator_id FROM rooms WHERE id = $1', [roomId]);
+  return room && room.creator_id === Number(userId);
 }
 
-function isRoomCreator(userId, roomId) {
-  const room = db.prepare('SELECT creator_id FROM rooms WHERE id = ?').get(roomId);
-  return room && room.creator_id === userId;
+async function isWhitelistEnabled(roomId) {
+  const row = await q1('SELECT COUNT(*) as c FROM room_whitelist WHERE room_id = $1', [roomId]);
+  return row ? Number(row.c) > 0 : false;
 }
 
-function isWhitelistEnabled(roomId) {
-  try {
-    const row = db.prepare('SELECT COUNT(*) as c FROM room_whitelist WHERE room_id = ?').get(Number(roomId));
-    return row ? Number(row.c) > 0 : false;
-  } catch(e) { return false; }
+async function isUserWhitelisted(userId, roomId) {
+  if (!await isWhitelistEnabled(roomId)) return true;
+  return !!(await q1('SELECT 1 FROM room_whitelist WHERE room_id = $1 AND user_id = $2', [roomId, userId]));
 }
 
-function isUserWhitelisted(userId, roomId) {
-  try {
-    if (!isWhitelistEnabled(Number(roomId))) return true; // no whitelist = everyone allowed
-    const row = db.prepare('SELECT 1 as found FROM room_whitelist WHERE room_id = ? AND user_id = ?').get(Number(roomId), Number(userId));
-    return row != null;
-  } catch(e) { return true; } // on error, allow through
+async function isUserMutedInRoom(userId, roomId) {
+  return !!(await q1('SELECT 1 FROM room_mutes WHERE (room_id = $1 OR room_id = 0) AND user_id = $2', [roomId, userId]));
 }
 
-function isUserMutedInRoom(userId, roomId) {
-  return !!db.prepare('SELECT 1 FROM room_mutes WHERE (room_id = ? OR room_id = 0) AND user_id = ?').get(roomId, userId);
-}
-
-function postSystemMessage(roomId, text) {
-  const serverUser = db.prepare("SELECT id FROM users WHERE username = 'Server' COLLATE NOCASE").get();
+async function postSystemMessage(roomId, text) {
+  const serverUser = await q1(`SELECT id FROM users WHERE LOWER(username) = 'server'`);
   if (!serverUser) return;
-  db.prepare('INSERT INTO messages (room_id, user_id, username, color, content, is_system) VALUES (?, ?, ?, ?, ?, 1)')
-    .run(roomId, serverUser.id, 'Server', '#7c6dfa', text);
+  await pool.query(
+    'INSERT INTO messages (room_id, user_id, username, color, content, is_system) VALUES ($1, $2, $3, $4, $5, 1)',
+    [roomId, serverUser.id, 'Server', '#7c6dfa', text]
+  );
 }
 
 // ── Daily reset ───────────────────────────────────────────────────────────────
 
-function resetMessages() {
-  db.prepare('DELETE FROM messages').run();
-  db.prepare('UPDATE rooms SET message_count = 0').run();
+async function resetMessages() {
+  await pool.query('DELETE FROM messages');
+  await pool.query('UPDATE rooms SET message_count = 0');
   console.log(`[${new Date().toISOString()}] Daily reset.`);
 }
 
@@ -252,491 +201,387 @@ function scheduleNextReset() {
   next.setUTCHours(0, 0, 0, 0);
   next.setUTCDate(next.getUTCDate() + 1);
   const msUntil = next - now;
-  setTimeout(() => { resetMessages(); scheduleNextReset(); }, msUntil);
+  setTimeout(async () => { await resetMessages(); scheduleNextReset(); }, msUntil);
   console.log(`Next reset in ${Math.round(msUntil / 1000 / 60)} minutes.`);
 }
-scheduleNextReset();
 
 // ── User routes ───────────────────────────────────────────────────────────────
 
-app.get('/api/users', (req, res) => {
-  const users = db.prepare("SELECT id, username, color FROM users WHERE banned = 0 AND username != 'Server' COLLATE NOCASE").all();
-  res.json(users);
+app.get('/api/users', async (req, res) => {
+  try {
+    const users = await q(`SELECT id, username, color FROM users WHERE banned = 0 AND LOWER(username) != 'server'`);
+    res.json(users);
+  } catch(e) { res.status(500).json({ error: 'Server error' }); }
 });
 
-app.post('/api/users/register', (req, res) => {
-  if (isIpBanned(req)) return res.status(403).json({ error: 'Access denied' });
-  const { username, password, color } = req.body;
-  if (!username || !password) return res.status(400).json({ error: 'username and password required' });
-  if (username.trim().toLowerCase() === 'server') return res.status(400).json({ error: '"Server" is a reserved username' });
-  if (username.length < 2 || username.length > 24) return res.status(400).json({ error: 'Username must be 2–24 characters' });
-  if (password.length < 4) return res.status(400).json({ error: 'Password must be at least 4 characters' });
-  const exists = db.prepare('SELECT id FROM users WHERE username = ? COLLATE NOCASE').get(username);
-  if (exists) return res.status(409).json({ error: 'Username taken' });
-  const userColor = color || '#44aaff';
-  const result = db.prepare('INSERT INTO users (username, password, color) VALUES (?, ?, ?)').run(username.trim(), password, userColor);
-  logIp(req, result.lastInsertRowid, 'register');
-  res.json({ success: true, id: result.lastInsertRowid, username: username.trim(), color: userColor });
+app.post('/api/users/register', async (req, res) => {
+  try {
+    if (await isIpBanned(req)) return res.status(403).json({ error: 'Access denied' });
+    const { username, password, color } = req.body;
+    if (!username || !password) return res.status(400).json({ error: 'username and password required' });
+    if (username.trim().toLowerCase() === 'server') return res.status(400).json({ error: '"Server" is a reserved username' });
+    if (username.length < 2 || username.length > 24) return res.status(400).json({ error: 'Username must be 2–24 characters' });
+    if (password.length < 4) return res.status(400).json({ error: 'Password must be at least 4 characters' });
+    const exists = await q1('SELECT id FROM users WHERE LOWER(username) = LOWER($1)', [username]);
+    if (exists) return res.status(409).json({ error: 'Username taken' });
+    const userColor = color || '#44aaff';
+    const result = await q1('INSERT INTO users (username, password, color) VALUES ($1, $2, $3) RETURNING id', [username.trim(), password, userColor]);
+    await logIp(req, result.id, 'register');
+    res.json({ success: true, id: result.id, username: username.trim(), color: userColor });
+  } catch(e) { res.status(500).json({ error: 'Server error' }); }
 });
 
-app.post('/api/users/login', (req, res) => {
-  if (isIpBanned(req)) return res.status(403).json({ error: 'Access denied' });
-  const { username, password } = req.body;
-  const user = getUser(username, password);
-  if (!user) return res.status(401).json({ error: 'Wrong username or password' });
-  if (user.banned) return res.status(403).json({ error: 'Account banned' + (user.ban_reason ? ': ' + user.ban_reason : '') });
-  logIp(req, user.id, 'login');
-  res.json({ success: true, id: user.id, username: user.username, color: user.color, is_mod: user.is_mod });
+app.post('/api/users/login', async (req, res) => {
+  try {
+    if (await isIpBanned(req)) return res.status(403).json({ error: 'Access denied' });
+    const { username, password } = req.body;
+    const user = await getUser(username, password);
+    if (!user) return res.status(401).json({ error: 'Wrong username or password' });
+    if (user.banned) return res.status(403).json({ error: 'Account banned' + (user.ban_reason ? ': ' + user.ban_reason : '') });
+    await logIp(req, user.id, 'login');
+    res.json({ success: true, id: user.id, username: user.username, color: user.color, is_mod: user.is_mod });
+  } catch(e) { res.status(500).json({ error: 'Server error' }); }
 });
 
-app.put('/api/users/:id', (req, res) => {
-  const { currentPassword, newUsername, newPassword, color } = req.body;
-  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.params.id);
-  if (!user) return res.status(404).json({ error: 'User not found' });
-  if (!isMaster(currentPassword) && user.password !== currentPassword) return res.status(403).json({ error: 'Wrong password' });
-  if (newUsername) {
-    if (newUsername.trim().toLowerCase() === 'server') return res.status(400).json({ error: '"Server" is a reserved username' });
-    if (newUsername.length < 2 || newUsername.length > 24) return res.status(400).json({ error: 'Username must be 2–24 characters' });
-    const taken = db.prepare('SELECT id FROM users WHERE username = ? COLLATE NOCASE AND id != ?').get(newUsername, user.id);
-    if (taken) return res.status(409).json({ error: 'Username taken' });
-  }
-  const updatedUsername = newUsername || user.username;
-  const updatedPassword = newPassword || user.password;
-  const updatedColor = color || user.color;
-  db.prepare('UPDATE users SET username = ?, password = ?, color = ? WHERE id = ?').run(updatedUsername, updatedPassword, updatedColor, user.id);
-  res.json({ success: true, id: user.id, username: updatedUsername, color: updatedColor, is_mod: user.is_mod });
+app.put('/api/users/:id', async (req, res) => {
+  try {
+    const { currentPassword, newUsername, newPassword, color } = req.body;
+    const user = await q1('SELECT * FROM users WHERE id = $1', [req.params.id]);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    if (!isMaster(currentPassword) && user.password !== currentPassword) return res.status(403).json({ error: 'Wrong password' });
+    if (newUsername) {
+      if (newUsername.trim().toLowerCase() === 'server') return res.status(400).json({ error: '"Server" is a reserved username' });
+      if (newUsername.length < 2 || newUsername.length > 24) return res.status(400).json({ error: 'Username must be 2–24 characters' });
+      const taken = await q1('SELECT id FROM users WHERE LOWER(username) = LOWER($1) AND id != $2', [newUsername, user.id]);
+      if (taken) return res.status(409).json({ error: 'Username taken' });
+    }
+    const updatedUsername = newUsername || user.username;
+    const updatedPassword = newPassword || user.password;
+    const updatedColor = color || user.color;
+    await pool.query('UPDATE users SET username = $1, password = $2, color = $3 WHERE id = $4', [updatedUsername, updatedPassword, updatedColor, user.id]);
+    res.json({ success: true, id: user.id, username: updatedUsername, color: updatedColor, is_mod: user.is_mod });
+  } catch(e) { res.status(500).json({ error: 'Server error' }); }
 });
 
 // ── Room routes ───────────────────────────────────────────────────────────────
 
-app.get('/api/rooms', (req, res) => {
-  const rooms = db.prepare(`
-    SELECT r.id, r.name, r.description, r.is_general, r.is_private, r.message_count, r.server_message, r.created_at,
-           u.username as creator_name, r.creator_id
-    FROM rooms r LEFT JOIN users u ON r.creator_id = u.id
-    ORDER BY r.is_general DESC, r.message_count DESC, r.created_at DESC
-  `).all();
-  res.json(rooms.map(r => ({ ...r, locked: r.is_private === 1 })));
+app.get('/api/rooms', async (req, res) => {
+  try {
+    const rooms = await q(`
+      SELECT r.id, r.name, r.description, r.is_general, r.is_private, r.message_count,
+             r.server_message, r.created_at, u.username as creator_name, r.creator_id
+      FROM rooms r LEFT JOIN users u ON r.creator_id = u.id
+      ORDER BY r.is_general DESC, r.message_count DESC, r.created_at DESC
+    `);
+    res.json(rooms.map(r => ({ ...r, locked: r.is_private === 1 })));
+  } catch(e) { res.status(500).json({ error: 'Server error' }); }
 });
 
-app.post('/api/rooms', (req, res) => {
-  const { name, description, creatorUsername, creatorPassword, roomPassword, isPrivate, serverMessage } = req.body;
-  if (!name) return res.status(400).json({ error: 'name required' });
-  if (name.length < 2 || name.length > 32) return res.status(400).json({ error: 'Room name must be 2–32 characters' });
-  const creator = getUser(creatorUsername, creatorPassword);
-  if (!creator) return res.status(401).json({ error: 'Invalid credentials' });
-  const exists = db.prepare('SELECT id FROM rooms WHERE name = ? COLLATE NOCASE').get(name);
-  if (exists) return res.status(409).json({ error: 'A room with that name already exists' });
-  if (isPrivate && !roomPassword) return res.status(400).json({ error: 'Private rooms need a password' });
-  const result = db.prepare(
-    'INSERT INTO rooms (name, description, creator_id, password, is_private, server_message) VALUES (?, ?, ?, ?, ?, ?)'
-  ).run(name, description || '', creator.id, roomPassword || null, isPrivate ? 1 : 0, serverMessage || '');
-  res.json({ success: true, id: result.lastInsertRowid });
+app.post('/api/rooms', async (req, res) => {
+  try {
+    const { name, description, creatorUsername, creatorPassword, roomPassword, isPrivate, serverMessage } = req.body;
+    if (!name) return res.status(400).json({ error: 'name required' });
+    if (name.length < 2 || name.length > 32) return res.status(400).json({ error: 'Room name must be 2–32 characters' });
+    const creator = await getUser(creatorUsername, creatorPassword);
+    if (!creator) return res.status(401).json({ error: 'Invalid credentials' });
+    const exists = await q1('SELECT id FROM rooms WHERE LOWER(name) = LOWER($1)', [name]);
+    if (exists) return res.status(409).json({ error: 'A room with that name already exists' });
+    if (isPrivate && !roomPassword) return res.status(400).json({ error: 'Private rooms need a password' });
+    const result = await q1(
+      'INSERT INTO rooms (name, description, creator_id, password, is_private, server_message) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id',
+      [name, description || '', creator.id, roomPassword || null, isPrivate ? 1 : 0, serverMessage || '']
+    );
+    res.json({ success: true, id: result.id });
+  } catch(e) { res.status(500).json({ error: 'Server error' }); }
 });
 
-app.delete('/api/rooms/:id', (req, res) => {
-  const { password } = req.body;
-  const room = db.prepare('SELECT * FROM rooms WHERE id = ?').get(req.params.id);
-  if (!room) return res.status(404).json({ error: 'Room not found' });
-  if (room.is_general) return res.status(403).json({ error: 'Cannot delete the General room' });
-  if (!isMaster(password) && room.password !== password) return res.status(403).json({ error: 'Wrong password' });
-  db.prepare('DELETE FROM messages WHERE room_id = ?').run(room.id);
-  db.prepare('DELETE FROM room_whitelist WHERE room_id = ?').run(room.id);
-  db.prepare('DELETE FROM room_mutes WHERE room_id = ?').run(room.id);
-  db.prepare('DELETE FROM rooms WHERE id = ?').run(room.id);
-  res.json({ success: true });
+app.delete('/api/rooms/:id', async (req, res) => {
+  try {
+    const { password } = req.body;
+    const room = await q1('SELECT * FROM rooms WHERE id = $1', [req.params.id]);
+    if (!room) return res.status(404).json({ error: 'Room not found' });
+    if (room.is_general) return res.status(403).json({ error: 'Cannot delete the General room' });
+    if (!isMaster(password) && room.password !== password) return res.status(403).json({ error: 'Wrong password' });
+    await pool.query('DELETE FROM messages WHERE room_id = $1', [room.id]);
+    await pool.query('DELETE FROM room_whitelist WHERE room_id = $1', [room.id]);
+    await pool.query('DELETE FROM room_mutes WHERE room_id = $1', [room.id]);
+    await pool.query('DELETE FROM rooms WHERE id = $1', [room.id]);
+    res.json({ success: true });
+  } catch(e) { res.status(500).json({ error: 'Server error' }); }
 });
 
-// Get room whitelist
-app.get('/api/rooms/:id/whitelist', (req, res) => {
-  const { roomPassword, password, username, userPassword } = req.query;
-  const room = db.prepare('SELECT * FROM rooms WHERE id = ?').get(req.params.id);
-  if (!room) return res.status(404).json({ error: 'Room not found' });
-  // Allow room creator, master, or whitelisted users to see list
-  const list = db.prepare('SELECT u.id, u.username, u.color FROM room_whitelist rw JOIN users u ON rw.user_id = u.id WHERE rw.room_id = ?').all(req.params.id);
-  res.json({ enabled: isWhitelistEnabled(parseInt(req.params.id)), users: list });
+app.get('/api/rooms/:id/whitelist', async (req, res) => {
+  try {
+    const roomId = req.params.id;
+    const enabled = await isWhitelistEnabled(roomId);
+    const users = await q('SELECT u.id, u.username, u.color FROM room_whitelist rw JOIN users u ON rw.user_id = u.id WHERE rw.room_id = $1', [roomId]);
+    res.json({ enabled, users });
+  } catch(e) { res.status(500).json({ error: 'Server error' }); }
 });
 
 // ── Message routes ────────────────────────────────────────────────────────────
 
-app.get('/api/rooms/:id/messages', (req, res) => {
-  const { roomPassword } = req.query;
-  const room = db.prepare('SELECT * FROM rooms WHERE id = ?').get(req.params.id);
-  if (!room) return res.status(404).json({ error: 'Room not found' });
-  if (room.is_private && !isMaster(roomPassword) && room.password !== roomPassword) {
-    return res.status(403).json({ error: 'Wrong room password' });
-  }
-  const messages = db.prepare(`
-    SELECT id, username, color, content, is_system, created_at FROM messages
-    WHERE room_id = ? ORDER BY created_at ASC LIMIT 200
-  `).all(req.params.id);
-  res.json(messages);
+app.get('/api/rooms/:id/messages', async (req, res) => {
+  try {
+    const { roomPassword } = req.query;
+    const room = await q1('SELECT * FROM rooms WHERE id = $1', [req.params.id]);
+    if (!room) return res.status(404).json({ error: 'Room not found' });
+    if (room.is_private && !isMaster(roomPassword) && room.password !== roomPassword) {
+      return res.status(403).json({ error: 'Wrong room password' });
+    }
+    const messages = await q(
+      'SELECT id, username, color, content, is_system, created_at FROM messages WHERE room_id = $1 ORDER BY created_at ASC LIMIT 200',
+      [req.params.id]
+    );
+    res.json(messages);
+  } catch(e) { res.status(500).json({ error: 'Server error' }); }
 });
 
-app.post('/api/rooms/:id/messages', (req, res) => {
-  const { username, password, content, roomPassword } = req.body;
-  if (!content || !content.trim()) return res.status(400).json({ error: 'Message cannot be empty' });
-  if (content.length > 1000) return res.status(400).json({ error: 'Message too long (max 1000 chars)' });
-
-  const user = getUser(username, password);
-  if (!user) return res.status(401).json({ error: 'Invalid credentials' });
-  if (user.banned) return res.status(403).json({ error: 'You are banned' });
-
-  const roomId = parseInt(req.params.id);
-  const room = db.prepare('SELECT * FROM rooms WHERE id = ?').get(roomId);
-  if (!room) return res.status(404).json({ error: 'Room not found' });
-
-  if (room.is_private && !isMaster(roomPassword) && room.password !== roomPassword) {
-    return res.status(403).json({ error: 'Wrong room password' });
-  }
-
-  const trimmed = content.trim();
-  const isCommand = trimmed.startsWith('/');
-  const isCreatorSending = isRoomCreator(user.id, roomId);
-  const isMasterSending = isMaster(password);
-  const isModSending = user.is_mod === 1;
-
-  // Commands bypass whitelist/mute so creators/mods can always manage their room
-  if (!isCommand) {
-    if (!isMasterSending && !isModSending && !isCreatorSending && !isUserWhitelisted(Number(user.id), Number(roomId))) {
-      return res.status(403).json({ error: 'You are not whitelisted in this room' });
+app.post('/api/rooms/:id/messages', async (req, res) => {
+  try {
+    const { username, password, content, roomPassword } = req.body;
+    if (!content || !content.trim()) return res.status(400).json({ error: 'Message cannot be empty' });
+    if (content.length > 1000) return res.status(400).json({ error: 'Message too long (max 1000 chars)' });
+    const user = await getUser(username, password);
+    if (!user) return res.status(401).json({ error: 'Invalid credentials' });
+    if (user.banned) return res.status(403).json({ error: 'You are banned' });
+    const roomId = Number(req.params.id);
+    const room = await q1('SELECT * FROM rooms WHERE id = $1', [roomId]);
+    if (!room) return res.status(404).json({ error: 'Room not found' });
+    if (room.is_private && !isMaster(roomPassword) && room.password !== roomPassword) {
+      return res.status(403).json({ error: 'Wrong room password' });
     }
-    if (isUserMutedInRoom(user.id, roomId)) return res.status(403).json({ error: 'You are muted in this room' });
-  }
-
-  if (isCommand) {
-    return handleCommand(req, res, user, room, trimmed, password, roomPassword);
-  }
-
-  db.prepare('INSERT INTO messages (room_id, user_id, username, color, content) VALUES (?, ?, ?, ?, ?)').run(roomId, user.id, user.username, user.color, trimmed);
-  db.prepare('UPDATE rooms SET message_count = message_count + 1 WHERE id = ?').run(roomId);
-  logIp(req, user.id);
-  res.json({ success: true });
+    const trimmed = content.trim();
+    const isCommand = trimmed.startsWith('/');
+    const isCreatorSending = await isRoomCreator(user.id, roomId);
+    const isMasterSending = isMaster(password);
+    const isModSending = user.is_mod === 1;
+    if (!isCommand) {
+      if (!isMasterSending && !isModSending && !isCreatorSending && !await isUserWhitelisted(user.id, roomId)) {
+        return res.status(403).json({ error: 'You are not whitelisted in this room' });
+      }
+      if (await isUserMutedInRoom(user.id, roomId)) return res.status(403).json({ error: 'You are muted in this room' });
+    }
+    if (isCommand) return handleCommand(req, res, user, room, trimmed, password, roomPassword);
+    await pool.query('INSERT INTO messages (room_id, user_id, username, color, content) VALUES ($1, $2, $3, $4, $5)', [roomId, user.id, user.username, user.color, trimmed]);
+    await pool.query('UPDATE rooms SET message_count = message_count + 1 WHERE id = $1', [roomId]);
+    await logIp(req, user.id);
+    res.json({ success: true });
+  } catch(e) { console.error(e); res.status(500).json({ error: 'Server error' }); }
 });
 
 // ── Command engine ────────────────────────────────────────────────────────────
 
 function parseArgs(str) {
-  // Parses: /cmd "quoted arg" bare_arg
   const args = [];
   const re = /"([^"]+)"|(\S+)/g;
   let m;
   while ((m = re.exec(str)) !== null) args.push(m[1] || m[2]);
-  return args; // args[0] = command, args[1..] = params
+  return args;
 }
 
-function handleCommand(req, res, user, room, content, password, roomPassword) {
+async function handleCommand(req, res, user, room, content, password, roomPassword) {
   const args = parseArgs(content);
   const cmd = args[0].toLowerCase();
-  const isCreator = isRoomCreator(user.id, room.id);
+  const isCreator = await isRoomCreator(user.id, room.id);
   const isMod = user.is_mod === 1;
-  const isMasterUser = isMaster(password); // 'password' is the raw password sent in the request
-
-  // Helper to check if caller has permission for a command
+  const isMasterUser = isMaster(password);
   function canMod() { return isMod || isMasterUser; }
   function canCreator() { return isCreator || isMod || isMasterUser; }
 
-  // /help
-  if (cmd === '/help') {
-    const lines = ['/help — show commands'];
-    if (canCreator()) {
-      lines.push('/ban "user" [reason] — ban from THIS room');
-      lines.push('/unban "user" — unban from THIS room');
-      lines.push('/mute "user" — mute in THIS room');
-      lines.push('/unmute "user" — unmute in THIS room');
-      lines.push('/delete — delete a message (shows picker)');
-      lines.push('/whitelist "user" — add user to whitelist (restricts room)');
-      lines.push('/unwhitelist "user" — remove user from whitelist');
-      lines.push('/clearwhitelist — open room back to everyone');
-      lines.push('/whitelistinfo — show who is whitelisted');
-      lines.push('/setmsg "message" — set server message');
-      lines.push('/clearmsg — clear server message');
-    }
-    if (canMod()) {
-      lines.push('/globalban "user" [reason] — ban globally');
-      lines.push('/globalunban "user" — unban globally');
-      lines.push('/globalmute "user" — mute globally');
-      lines.push('/globalunmute "user" — unmute globally');
-      lines.push('/makemod "user" — grant mod');
-      lines.push('/removemod "user" — revoke mod');
-      lines.push('/clearchat — clear all messages in this room');
-    }
-    postSystemMessage(room.id, lines.join('\n'));
-    db.prepare('UPDATE rooms SET message_count = message_count + 1 WHERE id = ?').run(room.id);
-    return res.json({ success: true });
-  }
-
-  // Room-creator commands (only affect THIS room)
-  if (cmd === '/ban' || cmd === '/unban' || cmd === '/mute' || cmd === '/unmute') {
-    if (!canCreator()) return res.status(403).json({ error: 'No permission' });
-    const targetName = args[1];
-    if (!targetName) return res.status(400).json({ error: `Usage: ${cmd} "username"` });
-    const target = db.prepare('SELECT * FROM users WHERE username = ? COLLATE NOCASE').get(targetName);
-    if (!target) return res.status(404).json({ error: `User "${targetName}" not found` });
-    if (target.id === user.id) return res.status(400).json({ error: "Can't do that to yourself" });
-
-    if (cmd === '/ban') {
-      const reason = args.slice(2).join(' ') || '';
-      // Room ban = mute in this room (can't send) + blacklist from whitelist
-      db.prepare('INSERT OR IGNORE INTO room_mutes (room_id, user_id) VALUES (?, ?)').run(room.id, target.id);
-      postSystemMessage(room.id, `${target.username} has been banned from this room.${reason ? ' Reason: ' + reason : ''}`);
-      modLog('room_ban', target.username, `room:${room.name}`);
-    } else if (cmd === '/unban') {
-      db.prepare('DELETE FROM room_mutes WHERE room_id = ? AND user_id = ?').run(room.id, target.id);
-      postSystemMessage(room.id, `${target.username} has been unbanned from this room.`);
-      modLog('room_unban', target.username, `room:${room.name}`);
-    } else if (cmd === '/mute') {
-      db.prepare('INSERT OR IGNORE INTO room_mutes (room_id, user_id) VALUES (?, ?)').run(room.id, target.id);
-      postSystemMessage(room.id, `${target.username} has been muted in this room.`);
-      modLog('room_mute', target.username, `room:${room.name}`);
-    } else if (cmd === '/unmute') {
-      db.prepare('DELETE FROM room_mutes WHERE room_id = ? AND user_id = ?').run(room.id, target.id);
-      postSystemMessage(room.id, `${target.username} has been unmuted in this room.`);
-      modLog('room_unmute', target.username, `room:${room.name}`);
-    }
-    db.prepare('UPDATE rooms SET message_count = message_count + 1 WHERE id = ?').run(room.id);
-    return res.json({ success: true });
-  }
-
-  // /whitelist, /unwhitelist, /clearwhitelist, /whitelistinfo (creator or mod)
-  if (cmd === '/whitelist' || cmd === '/unwhitelist' || cmd === '/clearwhitelist' || cmd === '/whitelistinfo') {
-    if (!canCreator()) return res.status(403).json({ error: 'No permission' });
-
-    if (cmd === '/clearwhitelist') {
-      db.prepare('DELETE FROM room_whitelist WHERE room_id = ?').run(Number(room.id));
-      postSystemMessage(room.id, `Whitelist cleared — room is now open to everyone.`);
-      modLog('whitelist_clear', room.name);
-      db.prepare('UPDATE rooms SET message_count = message_count + 1 WHERE id = ?').run(room.id);
+  try {
+    if (cmd === '/help') {
+      const lines = ['/help — show commands'];
+      if (canCreator()) {
+        lines.push('/ban "user" [reason] — ban from THIS room', '/unban "user" — unban from THIS room',
+          '/mute "user" — mute in THIS room', '/unmute "user" — unmute in THIS room',
+          '/whitelist "user" — add to whitelist', '/unwhitelist "user" — remove from whitelist',
+          '/clearwhitelist — open room to everyone', '/whitelistinfo — show whitelist',
+          '/setmsg "message" — set server message', '/clearmsg — clear server message',
+          '/delete — delete a message (picker)');
+      }
+      if (canMod()) {
+        lines.push('/globalban "user" [reason]', '/globalunban "user"',
+          '/globalmute "user"', '/globalunmute "user"',
+          '/makemod "user"', '/removemod "user"', '/clearchat');
+      }
+      await postSystemMessage(room.id, lines.join('\n'));
+      await pool.query('UPDATE rooms SET message_count = message_count + 1 WHERE id = $1', [room.id]);
       return res.json({ success: true });
     }
 
-    if (cmd === '/whitelistinfo') {
-      const enabled = isWhitelistEnabled(Number(room.id));
-      if (!enabled) {
-        postSystemMessage(room.id, `Whitelist is OFF — anyone can chat here. Use /whitelist "username" to enable it.`);
+    if (['/ban', '/unban', '/mute', '/unmute'].includes(cmd)) {
+      if (!canCreator()) return res.status(403).json({ error: 'No permission' });
+      const target = await q1('SELECT * FROM users WHERE LOWER(username) = LOWER($1)', [args[1]]);
+      if (!args[1]) return res.status(400).json({ error: `Usage: ${cmd} "username"` });
+      if (!target) return res.status(404).json({ error: `User "${args[1]}" not found` });
+      if (target.id === user.id) return res.status(400).json({ error: "Can't do that to yourself" });
+      if (cmd === '/ban') {
+        const reason = args.slice(2).join(' ') || '';
+        await pool.query('INSERT INTO room_mutes (room_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING', [room.id, target.id]);
+        await postSystemMessage(room.id, `${target.username} has been banned from this room.${reason ? ' Reason: ' + reason : ''}`);
+        await modLog('room_ban', target.username, `room:${room.name}`);
+      } else if (cmd === '/unban') {
+        await pool.query('DELETE FROM room_mutes WHERE room_id = $1 AND user_id = $2', [room.id, target.id]);
+        await postSystemMessage(room.id, `${target.username} has been unbanned from this room.`);
+      } else if (cmd === '/mute') {
+        await pool.query('INSERT INTO room_mutes (room_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING', [room.id, target.id]);
+        await postSystemMessage(room.id, `${target.username} has been muted in this room.`);
       } else {
-        const rows = db.prepare('SELECT u.username FROM room_whitelist rw JOIN users u ON rw.user_id = u.id WHERE rw.room_id = ?').all(Number(room.id));
-        const names = rows.map(r => r.username).join(', ');
-        postSystemMessage(room.id, `Whitelist is ON (${rows.length} users): ${names}\nUse /clearwhitelist to open the room to everyone.`);
+        await pool.query('DELETE FROM room_mutes WHERE room_id = $1 AND user_id = $2', [room.id, target.id]);
+        await postSystemMessage(room.id, `${target.username} has been unmuted in this room.`);
       }
-      db.prepare('UPDATE rooms SET message_count = message_count + 1 WHERE id = ?').run(room.id);
+      await pool.query('UPDATE rooms SET message_count = message_count + 1 WHERE id = $1', [room.id]);
       return res.json({ success: true });
     }
 
-    const targetName = args[1];
-    if (!targetName) return res.status(400).json({ error: `Usage: ${cmd} "username"` });
-    const target = db.prepare('SELECT * FROM users WHERE username = ? COLLATE NOCASE').get(targetName);
-    if (!target) return res.status(404).json({ error: `User "${targetName}" not found` });
-
-    if (cmd === '/whitelist') {
-      // Always add the creator first so they can never lock themselves out
-      db.prepare('INSERT OR IGNORE INTO room_whitelist (room_id, user_id) VALUES (?, ?)').run(Number(room.id), Number(user.id));
-      db.prepare('INSERT OR IGNORE INTO room_whitelist (room_id, user_id) VALUES (?, ?)').run(Number(room.id), Number(target.id));
-      postSystemMessage(room.id, `${target.username} added to whitelist. Room is now restricted — only whitelisted users can send messages. Use /clearwhitelist to open it back up.`);
-      modLog('whitelist_add', target.username, `room:${room.name}`);
-    } else {
-      // /unwhitelist — prevent removing self if you are creator
-      if (target.id === user.id && isRoomCreator(user.id, room.id)) {
-        return res.status(400).json({ error: "Can't remove yourself as creator — use /clearwhitelist instead" });
+    if (['/whitelist', '/unwhitelist', '/clearwhitelist', '/whitelistinfo'].includes(cmd)) {
+      if (!canCreator()) return res.status(403).json({ error: 'No permission' });
+      if (cmd === '/clearwhitelist') {
+        await pool.query('DELETE FROM room_whitelist WHERE room_id = $1', [room.id]);
+        await postSystemMessage(room.id, `Whitelist cleared — room is now open to everyone.`);
+      } else if (cmd === '/whitelistinfo') {
+        const enabled = await isWhitelistEnabled(room.id);
+        if (!enabled) {
+          await postSystemMessage(room.id, `Whitelist OFF — anyone can chat. Use /whitelist "username" to enable it.`);
+        } else {
+          const rows = await q('SELECT u.username FROM room_whitelist rw JOIN users u ON rw.user_id = u.id WHERE rw.room_id = $1', [room.id]);
+          await postSystemMessage(room.id, `Whitelist ON (${rows.length}): ${rows.map(r => r.username).join(', ')}\nUse /clearwhitelist to open to everyone.`);
+        }
+      } else {
+        if (!args[1]) return res.status(400).json({ error: `Usage: ${cmd} "username"` });
+        const target = await q1('SELECT * FROM users WHERE LOWER(username) = LOWER($1)', [args[1]]);
+        if (!target) return res.status(404).json({ error: `User "${args[1]}" not found` });
+        if (cmd === '/whitelist') {
+          await pool.query('INSERT INTO room_whitelist (room_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING', [room.id, user.id]);
+          await pool.query('INSERT INTO room_whitelist (room_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING', [room.id, target.id]);
+          await postSystemMessage(room.id, `${target.username} added to whitelist. Room is now restricted. Use /clearwhitelist to open it back up.`);
+          await modLog('whitelist_add', target.username, `room:${room.name}`);
+        } else {
+          if (target.id === user.id && isCreator) return res.status(400).json({ error: "Can't remove yourself — use /clearwhitelist instead" });
+          await pool.query('DELETE FROM room_whitelist WHERE room_id = $1 AND user_id = $2', [room.id, target.id]);
+          await postSystemMessage(room.id, `${target.username} removed from whitelist.`);
+        }
       }
-      db.prepare('DELETE FROM room_whitelist WHERE room_id = ? AND user_id = ?').run(Number(room.id), Number(target.id));
-      postSystemMessage(room.id, `${target.username} removed from whitelist.`);
-      modLog('whitelist_remove', target.username, `room:${room.name}`);
+      await pool.query('UPDATE rooms SET message_count = message_count + 1 WHERE id = $1', [room.id]);
+      return res.json({ success: true });
     }
-    db.prepare('UPDATE rooms SET message_count = message_count + 1 WHERE id = ?').run(room.id);
+
+    if (cmd === '/setmsg' || cmd === '/clearmsg') {
+      if (!canCreator()) return res.status(403).json({ error: 'No permission' });
+      const msg = cmd === '/setmsg' ? args.slice(1).join(' ') : '';
+      await pool.query('UPDATE rooms SET server_message = $1 WHERE id = $2', [msg, room.id]);
+      await postSystemMessage(room.id, msg ? `Server message updated.` : `Server message cleared.`);
+      await pool.query('UPDATE rooms SET message_count = message_count + 1 WHERE id = $1', [room.id]);
+      await modLog('set_server_msg', room.name, msg.slice(0, 60));
+      return res.json({ success: true });
+    }
+
+    if (cmd === '/delete') {
+      if (!canCreator()) return res.status(403).json({ error: 'No permission' });
+      const msgs = await q('SELECT id, username, content, created_at FROM messages WHERE room_id = $1 AND is_system = 0 ORDER BY created_at DESC LIMIT 50', [room.id]);
+      return res.json({ success: true, action: 'show_delete_picker', messages: msgs });
+    }
+
+    if (cmd === '/clearchat') {
+      if (!canMod()) return res.status(403).json({ error: 'No permission' });
+      await pool.query('DELETE FROM messages WHERE room_id = $1', [room.id]);
+      await pool.query('UPDATE rooms SET message_count = 0 WHERE id = $1', [room.id]);
+      await postSystemMessage(room.id, `Chat was cleared by a moderator.`);
+      await pool.query('UPDATE rooms SET message_count = 1 WHERE id = $1', [room.id]);
+      await modLog('clear_messages', room.name);
+      return res.json({ success: true });
+    }
+
+    // Global mod commands
+    for (const [c, action] of [['/globalban', 'ban'], ['/globalunban', 'unban'], ['/globalmute', 'mute'], ['/globalunmute', 'unmute'], ['/makemod', 'mod'], ['/removemod', 'unmod']]) {
+      if (cmd !== c) continue;
+      if (!canMod()) return res.status(403).json({ error: 'No permission' });
+      if (!args[1]) return res.status(400).json({ error: `Usage: ${cmd} "username"` });
+      const target = await q1('SELECT * FROM users WHERE LOWER(username) = LOWER($1)', [args[1]]);
+      if (!target) return res.status(404).json({ error: `User "${args[1]}" not found` });
+      const reason = args.slice(2).join(' ') || '';
+      if (action === 'ban') { await pool.query('UPDATE users SET banned = 1, ban_reason = $1 WHERE id = $2', [reason, target.id]); await postSystemMessage(room.id, `${target.username} has been globally banned.`); await modLog('ban_user', target.username, reason); }
+      if (action === 'unban') { await pool.query('UPDATE users SET banned = 0, ban_reason = $1 WHERE id = $2', ['', target.id]); await postSystemMessage(room.id, `${target.username} has been globally unbanned.`); await modLog('unban_user', target.username); }
+      if (action === 'mute') { await pool.query('INSERT INTO room_mutes (room_id, user_id) VALUES (0, $1) ON CONFLICT DO NOTHING', [target.id]); await postSystemMessage(room.id, `${target.username} globally muted.`); await modLog('mute_user', target.username, 'global'); }
+      if (action === 'unmute') { await pool.query('DELETE FROM room_mutes WHERE room_id = 0 AND user_id = $1', [target.id]); await postSystemMessage(room.id, `${target.username} globally unmuted.`); await modLog('unmute_user', target.username, 'global'); }
+      if (action === 'mod') { await pool.query('UPDATE users SET is_mod = 1 WHERE id = $1', [target.id]); await postSystemMessage(room.id, `${target.username} is now a moderator.`); await modLog('grant_mod', target.username); }
+      if (action === 'unmod') { await pool.query('UPDATE users SET is_mod = 0 WHERE id = $1', [target.id]); await postSystemMessage(room.id, `${target.username}'s mod status removed.`); await modLog('revoke_mod', target.username); }
+      await pool.query('UPDATE rooms SET message_count = message_count + 1 WHERE id = $1', [room.id]);
+      return res.json({ success: true });
+    }
+
+    await postSystemMessage(room.id, `Unknown command: ${cmd}. Type /help for commands.`);
+    await pool.query('UPDATE rooms SET message_count = message_count + 1 WHERE id = $1', [room.id]);
     return res.json({ success: true });
-  }
 
-  // /setmsg and /clearmsg (creator or mod)
-  if (cmd === '/setmsg' || cmd === '/clearmsg') {
-    if (!canCreator()) return res.status(403).json({ error: 'No permission' });
-    const msg = cmd === '/setmsg' ? args.slice(1).join(' ') : '';
-    db.prepare('UPDATE rooms SET server_message = ? WHERE id = ?').run(msg, room.id);
-    postSystemMessage(room.id, msg ? `Server message updated.` : `Server message cleared.`);
-    db.prepare('UPDATE rooms SET message_count = message_count + 1 WHERE id = ?').run(room.id);
-    modLog('set_server_msg', room.name, msg.slice(0, 60));
-    return res.json({ success: true });
-  }
-
-  // /delete — returns list of messages for frontend to pick from
-  if (cmd === '/delete') {
-    if (!canCreator()) return res.status(403).json({ error: 'No permission' });
-    const msgs = db.prepare('SELECT id, username, content, created_at FROM messages WHERE room_id = ? AND is_system = 0 ORDER BY created_at DESC LIMIT 50').all(room.id);
-    return res.json({ success: true, action: 'show_delete_picker', messages: msgs });
-  }
-
-  // /clearchat — mod/master only
-  if (cmd === '/clearchat') {
-    if (!canMod()) return res.status(403).json({ error: 'No permission' });
-    db.prepare('DELETE FROM messages WHERE room_id = ?').run(room.id);
-    db.prepare('UPDATE rooms SET message_count = 0 WHERE id = ?').run(room.id);
-    postSystemMessage(room.id, `Chat was cleared by a moderator.`);
-    db.prepare('UPDATE rooms SET message_count = 1 WHERE id = ?').run(room.id);
-    modLog('clear_messages', room.name);
-    return res.json({ success: true });
-  }
-
-  // Global mod commands
-  if (cmd === '/globalban') {
-    if (!canMod()) return res.status(403).json({ error: 'No permission' });
-    const targetName = args[1]; const reason = args.slice(2).join(' ') || '';
-    if (!targetName) return res.status(400).json({ error: 'Usage: /globalban "username" [reason]' });
-    const target = db.prepare('SELECT * FROM users WHERE username = ? COLLATE NOCASE').get(targetName);
-    if (!target) return res.status(404).json({ error: `User "${targetName}" not found` });
-    db.prepare('UPDATE users SET banned = 1, ban_reason = ? WHERE id = ?').run(reason, target.id);
-    postSystemMessage(room.id, `${target.username} has been globally banned.`);
-    db.prepare('UPDATE rooms SET message_count = message_count + 1 WHERE id = ?').run(room.id);
-    modLog('ban_user', target.username, reason);
-    return res.json({ success: true });
-  }
-
-  if (cmd === '/globalunban') {
-    if (!canMod()) return res.status(403).json({ error: 'No permission' });
-    const targetName = args[1];
-    if (!targetName) return res.status(400).json({ error: 'Usage: /globalunban "username"' });
-    const target = db.prepare('SELECT * FROM users WHERE username = ? COLLATE NOCASE').get(targetName);
-    if (!target) return res.status(404).json({ error: `User "${targetName}" not found` });
-    db.prepare('UPDATE users SET banned = 0, ban_reason = "" WHERE id = ?').run(target.id);
-    postSystemMessage(room.id, `${target.username} has been globally unbanned.`);
-    db.prepare('UPDATE rooms SET message_count = message_count + 1 WHERE id = ?').run(room.id);
-    modLog('unban_user', target.username);
-    return res.json({ success: true });
-  }
-
-  if (cmd === '/globalmute') {
-    if (!canMod()) return res.status(403).json({ error: 'No permission' });
-    const targetName = args[1];
-    if (!targetName) return res.status(400).json({ error: 'Usage: /globalmute "username"' });
-    const target = db.prepare('SELECT * FROM users WHERE username = ? COLLATE NOCASE').get(targetName);
-    if (!target) return res.status(404).json({ error: `User "${targetName}" not found` });
-    db.prepare('INSERT OR IGNORE INTO room_mutes (room_id, user_id) VALUES (0, ?)').run(target.id);
-    postSystemMessage(room.id, `${target.username} has been globally muted.`);
-    db.prepare('UPDATE rooms SET message_count = message_count + 1 WHERE id = ?').run(room.id);
-    modLog('mute_user', target.username, 'global');
-    return res.json({ success: true });
-  }
-
-  if (cmd === '/globalunmute') {
-    if (!canMod()) return res.status(403).json({ error: 'No permission' });
-    const targetName = args[1];
-    if (!targetName) return res.status(400).json({ error: 'Usage: /globalunmute "username"' });
-    const target = db.prepare('SELECT * FROM users WHERE username = ? COLLATE NOCASE').get(targetName);
-    if (!target) return res.status(404).json({ error: `User "${targetName}" not found` });
-    db.prepare('DELETE FROM room_mutes WHERE room_id = 0 AND user_id = ?').run(target.id);
-    postSystemMessage(room.id, `${target.username} has been globally unmuted.`);
-    db.prepare('UPDATE rooms SET message_count = message_count + 1 WHERE id = ?').run(room.id);
-    modLog('unmute_user', target.username, 'global');
-    return res.json({ success: true });
-  }
-
-  if (cmd === '/makemod') {
-    if (!canMod()) return res.status(403).json({ error: 'No permission' });
-    const targetName = args[1];
-    if (!targetName) return res.status(400).json({ error: 'Usage: /makemod "username"' });
-    const target = db.prepare('SELECT * FROM users WHERE username = ? COLLATE NOCASE').get(targetName);
-    if (!target) return res.status(404).json({ error: `User "${targetName}" not found` });
-    db.prepare('UPDATE users SET is_mod = 1 WHERE id = ?').run(target.id);
-    postSystemMessage(room.id, `${target.username} has been made a moderator.`);
-    db.prepare('UPDATE rooms SET message_count = message_count + 1 WHERE id = ?').run(room.id);
-    modLog('grant_mod', target.username);
-    return res.json({ success: true });
-  }
-
-  if (cmd === '/removemod') {
-    if (!canMod()) return res.status(403).json({ error: 'No permission' });
-    const targetName = args[1];
-    if (!targetName) return res.status(400).json({ error: 'Usage: /removemod "username"' });
-    const target = db.prepare('SELECT * FROM users WHERE username = ? COLLATE NOCASE').get(targetName);
-    if (!target) return res.status(404).json({ error: `User "${targetName}" not found` });
-    db.prepare('UPDATE users SET is_mod = 0 WHERE id = ?').run(target.id);
-    postSystemMessage(room.id, `${target.username}'s moderator status has been removed.`);
-    db.prepare('UPDATE rooms SET message_count = message_count + 1 WHERE id = ?').run(room.id);
-    modLog('revoke_mod', target.username);
-    return res.json({ success: true });
-  }
-
-  // Unknown command
-  postSystemMessage(room.id, `Unknown command: ${cmd}. Type /help for available commands.`);
-  db.prepare('UPDATE rooms SET message_count = message_count + 1 WHERE id = ?').run(room.id);
-  return res.json({ success: true });
+  } catch(e) { console.error(e); res.status(500).json({ error: 'Server error' }); }
 }
 
-// Delete a specific message (for /delete picker)
-app.delete('/api/rooms/:roomId/messages/:msgId', (req, res) => {
-  const { username, password, roomPassword } = req.body;
-  const user = getUser(username, password);
-  if (!user) return res.status(401).json({ error: 'Invalid credentials' });
-  const roomId = parseInt(req.params.roomId);
-  const room = db.prepare('SELECT * FROM rooms WHERE id = ?').get(roomId);
-  if (!room) return res.status(404).json({ error: 'Room not found' });
-  const isCreator = isRoomCreator(user.id, roomId);
-  if (!isCreator && !user.is_mod && !isMaster(password)) return res.status(403).json({ error: 'No permission' });
-  db.prepare('DELETE FROM messages WHERE id = ? AND room_id = ?').run(req.params.msgId, roomId);
-  db.prepare('UPDATE rooms SET message_count = (SELECT COUNT(*) FROM messages WHERE room_id = ?) WHERE id = ?').run(roomId, roomId);
-  res.json({ success: true });
+app.delete('/api/rooms/:roomId/messages/:msgId', async (req, res) => {
+  try {
+    const { username, password } = req.body;
+    const user = await getUser(username, password);
+    if (!user) return res.status(401).json({ error: 'Invalid credentials' });
+    const roomId = Number(req.params.roomId);
+    const isCreator = await isRoomCreator(user.id, roomId);
+    if (!isCreator && !user.is_mod && !isMaster(password)) return res.status(403).json({ error: 'No permission' });
+    await pool.query('DELETE FROM messages WHERE id = $1 AND room_id = $2', [req.params.msgId, roomId]);
+    await pool.query('UPDATE rooms SET message_count = (SELECT COUNT(*) FROM messages WHERE room_id = $1) WHERE id = $1', [roomId]);
+    res.json({ success: true });
+  } catch(e) { res.status(500).json({ error: 'Server error' }); }
 });
 
 // ── Direct Messages ───────────────────────────────────────────────────────────
 
-app.get('/api/dm/:userId/inbox', (req, res) => {
-  const { password } = req.query;
-  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.params.userId);
-  if (!user || user.password !== password) return res.status(401).json({ error: 'Unauthorized' });
-  const partners = db.prepare(`
-    SELECT DISTINCT CASE WHEN sender_id = ? THEN receiver_id ELSE sender_id END as partner_id,
-      MAX(created_at) as last_time
-    FROM direct_messages WHERE sender_id = ? OR receiver_id = ?
-    GROUP BY partner_id ORDER BY last_time DESC
-  `).all(user.id, user.id, user.id);
-  const result = partners.map(p => {
-    const partner = db.prepare('SELECT id, username, color FROM users WHERE id = ?').get(p.partner_id);
-    if (!partner) return null;
-    const last = db.prepare(`
-      SELECT * FROM direct_messages
-      WHERE (sender_id = ? AND receiver_id = ?) OR (sender_id = ? AND receiver_id = ?)
-      ORDER BY created_at DESC LIMIT 1
-    `).get(user.id, p.partner_id, p.partner_id, user.id);
-    return { partner, last };
-  }).filter(Boolean);
-  res.json(result);
+app.get('/api/dm/:userId/inbox', async (req, res) => {
+  try {
+    const { password } = req.query;
+    const user = await q1('SELECT * FROM users WHERE id = $1', [req.params.userId]);
+    if (!user || user.password !== password) return res.status(401).json({ error: 'Unauthorized' });
+    const partners = await q(`
+      SELECT DISTINCT CASE WHEN sender_id = $1 THEN receiver_id ELSE sender_id END as partner_id,
+        MAX(created_at) as last_time
+      FROM direct_messages WHERE sender_id = $1 OR receiver_id = $1
+      GROUP BY partner_id ORDER BY last_time DESC
+    `, [user.id]);
+    const result = await Promise.all(partners.map(async p => {
+      const partner = await q1('SELECT id, username, color FROM users WHERE id = $1', [p.partner_id]);
+      if (!partner) return null;
+      const last = await q1(`SELECT * FROM direct_messages WHERE (sender_id=$1 AND receiver_id=$2) OR (sender_id=$2 AND receiver_id=$1) ORDER BY created_at DESC LIMIT 1`, [user.id, p.partner_id]);
+      return { partner, last };
+    }));
+    res.json(result.filter(Boolean));
+  } catch(e) { res.status(500).json({ error: 'Server error' }); }
 });
 
-app.get('/api/dm/:userId/:partnerId', (req, res) => {
-  const { password } = req.query;
-  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.params.userId);
-  if (!user || user.password !== password) return res.status(401).json({ error: 'Unauthorized' });
-  const partner = db.prepare('SELECT id, username, color FROM users WHERE id = ?').get(req.params.partnerId);
-  if (!partner) return res.status(404).json({ error: 'User not found' });
-  const messages = db.prepare(`
-    SELECT dm.id, dm.sender_id, u.username as sender_name, dm.content, dm.created_at
-    FROM direct_messages dm JOIN users u ON dm.sender_id = u.id
-    WHERE (dm.sender_id = ? AND dm.receiver_id = ?) OR (dm.sender_id = ? AND dm.receiver_id = ?)
-    ORDER BY dm.created_at ASC LIMIT 200
-  `).all(user.id, partner.id, partner.id, user.id);
-  res.json({ them: partner, messages });
+app.get('/api/dm/:userId/:partnerId', async (req, res) => {
+  try {
+    const { password } = req.query;
+    const user = await q1('SELECT * FROM users WHERE id = $1', [req.params.userId]);
+    if (!user || user.password !== password) return res.status(401).json({ error: 'Unauthorized' });
+    const partner = await q1('SELECT id, username, color FROM users WHERE id = $1', [req.params.partnerId]);
+    if (!partner) return res.status(404).json({ error: 'User not found' });
+    const messages = await q(`SELECT dm.id, dm.sender_id, u.username as sender_name, dm.content, dm.created_at FROM direct_messages dm JOIN users u ON dm.sender_id = u.id WHERE (dm.sender_id=$1 AND dm.receiver_id=$2) OR (dm.sender_id=$2 AND dm.receiver_id=$1) ORDER BY dm.created_at ASC LIMIT 200`, [user.id, partner.id]);
+    res.json({ them: partner, messages });
+  } catch(e) { res.status(500).json({ error: 'Server error' }); }
 });
 
-app.post('/api/dm/:userId/:partnerId', (req, res) => {
-  const { password, content } = req.body;
-  if (!content || !content.trim()) return res.status(400).json({ error: 'Empty message' });
-  if (content.length > 1000) return res.status(400).json({ error: 'Too long' });
-  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.params.userId);
-  if (!user || user.password !== password) return res.status(401).json({ error: 'Unauthorized' });
-  if (user.banned) return res.status(403).json({ error: 'You are banned' });
-  const partner = db.prepare('SELECT id FROM users WHERE id = ?').get(req.params.partnerId);
-  if (!partner) return res.status(404).json({ error: 'User not found' });
-  db.prepare('INSERT INTO direct_messages (sender_id, receiver_id, content) VALUES (?, ?, ?)').run(user.id, partner.id, content.trim());
-  res.json({ success: true });
+app.post('/api/dm/:userId/:partnerId', async (req, res) => {
+  try {
+    const { password, content } = req.body;
+    if (!content || !content.trim()) return res.status(400).json({ error: 'Empty message' });
+    const user = await q1('SELECT * FROM users WHERE id = $1', [req.params.userId]);
+    if (!user || user.password !== password) return res.status(401).json({ error: 'Unauthorized' });
+    if (user.banned) return res.status(403).json({ error: 'You are banned' });
+    const partner = await q1('SELECT id FROM users WHERE id = $1', [req.params.partnerId]);
+    if (!partner) return res.status(404).json({ error: 'User not found' });
+    await pool.query('INSERT INTO direct_messages (sender_id, receiver_id, content) VALUES ($1, $2, $3)', [user.id, partner.id, content.trim()]);
+    res.json({ success: true });
+  } catch(e) { res.status(500).json({ error: 'Server error' }); }
 });
 
-// ── Mod API ───────────────────────────────────────────────────────────────────
-
-// ── Mod login (POST so it works from file:// without CORS query-string issues) ─
-app.post('/api/mod/login', (req, res) => {
-  const { password } = req.body;
-  if (!isMaster(password)) return res.status(403).json({ error: 'Wrong password' });
-  res.json({ success: true });
-});
+// ── Mod routes ────────────────────────────────────────────────────────────────
 
 function checkMod(req, res) {
   const pw = req.query.password || req.body?.password;
@@ -744,241 +589,254 @@ function checkMod(req, res) {
   return true;
 }
 
-app.get('/api/mod/users', (req, res) => {
-  if (!checkMod(req, res)) return;
-  const users = db.prepare(`
-    SELECT u.id, u.username, u.color, u.is_mod, u.muted, u.banned, u.ban_reason, u.created_at,
-      COUNT(m.id) as message_count
-    FROM users u LEFT JOIN messages m ON m.user_id = u.id
-    WHERE u.username != 'Server' COLLATE NOCASE
-    GROUP BY u.id ORDER BY u.created_at DESC
-  `).all();
-  res.json(users);
-});
-
-app.get('/api/mod/rooms', (req, res) => {
-  if (!checkMod(req, res)) return;
-  const rooms = db.prepare(`
-    SELECT r.id, r.name, r.description, r.is_general, r.is_private, r.message_count, r.server_message, r.created_at,
-           u.username as creator_name
-    FROM rooms r LEFT JOIN users u ON r.creator_id = u.id
-    ORDER BY r.is_general DESC, r.message_count DESC
-  `).all();
-  res.json(rooms);
-});
-
-app.get('/api/mod/rooms/:id/messages', (req, res) => {
-  if (!checkMod(req, res)) return;
-  const msgs = db.prepare(`
-    SELECT m.id, m.username, m.color, m.content, m.is_system, m.created_at,
-           r.name as room_name
-    FROM messages m JOIN rooms r ON m.room_id = r.id
-    WHERE m.room_id = ?
-    ORDER BY m.created_at DESC LIMIT 100
-  `).all(req.params.id);
-  res.json(msgs);
-});
-
-app.get('/api/mod/ips', (req, res) => {
-  if (!checkMod(req, res)) return;
-  const ips = db.prepare(`
-    SELECT il.ip, COUNT(*) as event_count, MAX(il.created_at) as last_seen,
-      GROUP_CONCAT(DISTINCT u.username) as usernames_raw,
-      CASE WHEN bi.ip IS NOT NULL THEN 1 ELSE 0 END as banned,
-      bi.reason as ban_reason
-    FROM ip_log il
-    LEFT JOIN users u ON il.user_id = u.id
-    LEFT JOIN banned_ips bi ON il.ip = bi.ip
-    GROUP BY il.ip ORDER BY last_seen DESC
-  `).all();
-  res.json(ips.map(i => ({ ...i, usernames: i.usernames_raw ? i.usernames_raw.split(',').filter(Boolean) : [] })));
-});
-
-app.get('/api/mod/ip/:ip/messages', (req, res) => {
-  if (!checkMod(req, res)) return;
-  const ip = decodeURIComponent(req.params.ip);
-  const userIds = db.prepare('SELECT DISTINCT user_id FROM ip_log WHERE ip = ?').all(ip).map(r => r.user_id).filter(Boolean);
-  if (!userIds.length) return res.json([]);
-  const placeholders = userIds.map(() => '?').join(',');
-  const msgs = db.prepare(`
-    SELECT m.id, m.content, m.created_at, m.username, r.name as room_name
-    FROM messages m JOIN rooms r ON m.room_id = r.id
-    WHERE m.user_id IN (${placeholders})
-    ORDER BY m.created_at DESC LIMIT 100
-  `).all(...userIds);
-  res.json(msgs);
-});
-
-app.get('/api/mod/users/:id/messages', (req, res) => {
-  if (!checkMod(req, res)) return;
-  const msgs = db.prepare(`
-    SELECT m.id, m.content, m.created_at, m.username, r.name as room_name,
-           (SELECT il.ip FROM ip_log il WHERE il.user_id = m.user_id ORDER BY il.created_at DESC LIMIT 1) as ip
-    FROM messages m JOIN rooms r ON m.room_id = r.id
-    WHERE m.user_id = ? ORDER BY m.created_at DESC LIMIT 100
-  `).all(req.params.id);
-  res.json(msgs);
-});
-
-app.get('/api/mod/log', (req, res) => {
-  if (!checkMod(req, res)) return;
-  const logs = db.prepare('SELECT * FROM mod_log ORDER BY created_at DESC LIMIT 300').all();
-  res.json(logs);
-});
-
-app.post('/api/mod/users/:id/ban', (req, res) => {
-  if (!checkMod(req, res)) return;
-  const { reason } = req.body;
-  const user = db.prepare('SELECT username FROM users WHERE id = ?').get(req.params.id);
-  db.prepare('UPDATE users SET banned = 1, ban_reason = ? WHERE id = ?').run(reason || '', req.params.id);
-  if (user) modLog('ban_user', user.username, reason || '');
+app.post('/api/mod/login', (req, res) => {
+  const { password } = req.body;
+  if (!isMaster(password)) return res.status(403).json({ error: 'Wrong password' });
   res.json({ success: true });
 });
 
-app.post('/api/mod/users/:id/unban', (req, res) => {
+app.get('/api/mod/users', async (req, res) => {
   if (!checkMod(req, res)) return;
-  const user = db.prepare('SELECT username FROM users WHERE id = ?').get(req.params.id);
-  db.prepare('UPDATE users SET banned = 0, ban_reason = "" WHERE id = ?').run(req.params.id);
-  if (user) modLog('unban_user', user.username);
-  res.json({ success: true });
+  try {
+    const users = await q(`SELECT u.id, u.username, u.color, u.is_mod, u.banned, u.ban_reason, u.created_at, COUNT(m.id) as message_count FROM users u LEFT JOIN messages m ON m.user_id = u.id WHERE LOWER(u.username) != 'server' GROUP BY u.id ORDER BY u.created_at DESC`);
+    res.json(users);
+  } catch(e) { res.status(500).json({ error: 'Server error' }); }
 });
 
-app.post('/api/mod/users/:id/mute', (req, res) => {
+app.get('/api/mod/rooms', async (req, res) => {
   if (!checkMod(req, res)) return;
-  const user = db.prepare('SELECT username FROM users WHERE id = ?').get(req.params.id);
-  db.prepare('INSERT OR IGNORE INTO room_mutes (room_id, user_id) VALUES (0, ?)').run(req.params.id);
-  if (user) modLog('mute_user', user.username, 'global');
-  res.json({ success: true });
+  try {
+    const rooms = await q(`SELECT r.id, r.name, r.description, r.is_general, r.is_private, r.message_count, r.server_message, r.created_at, u.username as creator_name FROM rooms r LEFT JOIN users u ON r.creator_id = u.id ORDER BY r.is_general DESC, r.message_count DESC`);
+    res.json(rooms);
+  } catch(e) { res.status(500).json({ error: 'Server error' }); }
 });
 
-app.post('/api/mod/users/:id/unmute', (req, res) => {
+app.get('/api/mod/rooms/:id/messages', async (req, res) => {
   if (!checkMod(req, res)) return;
-  const user = db.prepare('SELECT username FROM users WHERE id = ?').get(req.params.id);
-  db.prepare('DELETE FROM room_mutes WHERE room_id = 0 AND user_id = ?').run(req.params.id);
-  if (user) modLog('unmute_user', user.username, 'global');
-  res.json({ success: true });
+  try {
+    const msgs = await q(`SELECT m.id, m.username, m.color, m.content, m.is_system, m.created_at, r.name as room_name FROM messages m JOIN rooms r ON m.room_id = r.id WHERE m.room_id = $1 ORDER BY m.created_at DESC LIMIT 100`, [req.params.id]);
+    res.json(msgs);
+  } catch(e) { res.status(500).json({ error: 'Server error' }); }
 });
 
-app.post('/api/mod/users/:id/setmod', (req, res) => {
+app.get('/api/mod/ips', async (req, res) => {
   if (!checkMod(req, res)) return;
-  const { is_mod } = req.body;
-  const user = db.prepare('SELECT username FROM users WHERE id = ?').get(req.params.id);
-  db.prepare('UPDATE users SET is_mod = ? WHERE id = ?').run(is_mod ? 1 : 0, req.params.id);
-  if (user) modLog(is_mod ? 'grant_mod' : 'revoke_mod', user.username);
-  res.json({ success: true });
+  try {
+    const ips = await q(`SELECT il.ip, COUNT(*) as event_count, MAX(il.created_at) as last_seen, STRING_AGG(DISTINCT u.username, ',') as usernames_raw, CASE WHEN bi.ip IS NOT NULL THEN 1 ELSE 0 END as banned, bi.reason as ban_reason FROM ip_log il LEFT JOIN users u ON il.user_id = u.id LEFT JOIN banned_ips bi ON il.ip = bi.ip GROUP BY il.ip, bi.ip, bi.reason ORDER BY last_seen DESC`);
+    res.json(ips.map(i => ({ ...i, usernames: i.usernames_raw ? i.usernames_raw.split(',').filter(Boolean) : [] })));
+  } catch(e) { res.status(500).json({ error: 'Server error' }); }
 });
 
-app.delete('/api/mod/users/:id', (req, res) => {
+app.get('/api/mod/ip/:ip/messages', async (req, res) => {
   if (!checkMod(req, res)) return;
-  const user = db.prepare('SELECT username FROM users WHERE id = ?').get(req.params.id);
-  db.prepare('DELETE FROM messages WHERE user_id = ?').run(req.params.id);
-  db.prepare('DELETE FROM direct_messages WHERE sender_id = ? OR receiver_id = ?').run(req.params.id, req.params.id);
-  db.prepare('DELETE FROM room_whitelist WHERE user_id = ?').run(req.params.id);
-  db.prepare('DELETE FROM room_mutes WHERE user_id = ?').run(req.params.id);
-  db.prepare('DELETE FROM users WHERE id = ?').run(req.params.id);
-  db.prepare('UPDATE rooms SET message_count = (SELECT COUNT(*) FROM messages WHERE room_id = rooms.id)').run();
-  if (user) modLog('delete_user', user.username);
-  res.json({ success: true });
+  try {
+    const ip = decodeURIComponent(req.params.ip);
+    const msgs = await q(`SELECT m.id, m.content, m.created_at, m.username, r.name as room_name FROM messages m JOIN rooms r ON m.room_id = r.id WHERE m.user_id IN (SELECT DISTINCT user_id FROM ip_log WHERE ip = $1 AND user_id IS NOT NULL) ORDER BY m.created_at DESC LIMIT 100`, [ip]);
+    res.json(msgs);
+  } catch(e) { res.status(500).json({ error: 'Server error' }); }
 });
 
-app.delete('/api/mod/users/:id/messages', (req, res) => {
+app.get('/api/mod/users/:id/messages', async (req, res) => {
   if (!checkMod(req, res)) return;
-  const user = db.prepare('SELECT username FROM users WHERE id = ?').get(req.params.id);
-  db.prepare('DELETE FROM messages WHERE user_id = ?').run(req.params.id);
-  db.prepare('UPDATE rooms SET message_count = (SELECT COUNT(*) FROM messages WHERE room_id = rooms.id)').run();
-  if (user) modLog('clear_messages', user.username);
-  res.json({ success: true });
+  try {
+    const msgs = await q(`SELECT m.id, m.content, m.created_at, m.username, r.name as room_name, (SELECT il.ip FROM ip_log il WHERE il.user_id = m.user_id ORDER BY il.created_at DESC LIMIT 1) as ip FROM messages m JOIN rooms r ON m.room_id = r.id WHERE m.user_id = $1 ORDER BY m.created_at DESC LIMIT 100`, [req.params.id]);
+    res.json(msgs);
+  } catch(e) { res.status(500).json({ error: 'Server error' }); }
 });
 
-app.delete('/api/mod/rooms/:id', (req, res) => {
+app.get('/api/mod/log', async (req, res) => {
   if (!checkMod(req, res)) return;
-  const room = db.prepare('SELECT * FROM rooms WHERE id = ?').get(req.params.id);
-  if (!room) return res.status(404).json({ error: 'Not found' });
-  if (room.is_general) return res.status(403).json({ error: 'Cannot delete General' });
-  db.prepare('DELETE FROM messages WHERE room_id = ?').run(room.id);
-  db.prepare('DELETE FROM room_whitelist WHERE room_id = ?').run(room.id);
-  db.prepare('DELETE FROM room_mutes WHERE room_id = ?').run(room.id);
-  db.prepare('DELETE FROM rooms WHERE id = ?').run(room.id);
-  modLog('delete_room', room.name);
-  res.json({ success: true });
+  try { res.json(await q('SELECT * FROM mod_log ORDER BY created_at DESC LIMIT 300')); }
+  catch(e) { res.status(500).json({ error: 'Server error' }); }
 });
 
-app.delete('/api/mod/messages/:id', (req, res) => {
+app.post('/api/mod/users/:id/ban', async (req, res) => {
   if (!checkMod(req, res)) return;
-  const msg = db.prepare('SELECT room_id FROM messages WHERE id = ?').get(req.params.id);
-  db.prepare('DELETE FROM messages WHERE id = ?').run(req.params.id);
-  if (msg) db.prepare('UPDATE rooms SET message_count = (SELECT COUNT(*) FROM messages WHERE room_id = ?) WHERE id = ?').run(msg.room_id, msg.room_id);
-  modLog('delete_message', '#' + req.params.id);
-  res.json({ success: true });
+  try {
+    const { reason } = req.body;
+    const user = await q1('SELECT username FROM users WHERE id = $1', [req.params.id]);
+    await pool.query('UPDATE users SET banned = 1, ban_reason = $1 WHERE id = $2', [reason || '', req.params.id]);
+    if (user) await modLog('ban_user', user.username, reason || '');
+    res.json({ success: true });
+  } catch(e) { res.status(500).json({ error: 'Server error' }); }
 });
 
-app.post('/api/mod/ban-ip', (req, res) => {
+app.post('/api/mod/users/:id/unban', async (req, res) => {
   if (!checkMod(req, res)) return;
-  const { ip, reason } = req.body;
-  if (!ip) return res.status(400).json({ error: 'IP required' });
-  db.prepare('INSERT OR REPLACE INTO banned_ips (ip, reason) VALUES (?, ?)').run(ip, reason || '');
-  modLog('ban_ip', ip, reason || '');
-  res.json({ success: true });
+  try {
+    const user = await q1('SELECT username FROM users WHERE id = $1', [req.params.id]);
+    await pool.query('UPDATE users SET banned = 0, ban_reason = $1 WHERE id = $2', ['', req.params.id]);
+    if (user) await modLog('unban_user', user.username);
+    res.json({ success: true });
+  } catch(e) { res.status(500).json({ error: 'Server error' }); }
 });
 
-app.post('/api/mod/unban-ip', (req, res) => {
+app.post('/api/mod/users/:id/mute', async (req, res) => {
   if (!checkMod(req, res)) return;
-  const { ip } = req.body;
-  db.prepare('DELETE FROM banned_ips WHERE ip = ?').run(ip);
-  modLog('unban_ip', ip);
-  res.json({ success: true });
+  try {
+    const user = await q1('SELECT username FROM users WHERE id = $1', [req.params.id]);
+    await pool.query('INSERT INTO room_mutes (room_id, user_id) VALUES (0, $1) ON CONFLICT DO NOTHING', [req.params.id]);
+    if (user) await modLog('mute_user', user.username, 'global');
+    res.json({ success: true });
+  } catch(e) { res.status(500).json({ error: 'Server error' }); }
 });
 
-// Clear entire whitelist for a room (mod panel)
-app.delete('/api/mod/rooms/:id/whitelist', (req, res) => {
+app.post('/api/mod/users/:id/unmute', async (req, res) => {
   if (!checkMod(req, res)) return;
-  const room = db.prepare('SELECT name FROM rooms WHERE id = ?').get(req.params.id);
-  db.prepare('DELETE FROM room_whitelist WHERE room_id = ?').run(Number(req.params.id));
-  if (room) modLog('whitelist_clear', room.name, 'via mod panel');
-  res.json({ success: true });
+  try {
+    const user = await q1('SELECT username FROM users WHERE id = $1', [req.params.id]);
+    await pool.query('DELETE FROM room_mutes WHERE room_id = 0 AND user_id = $1', [req.params.id]);
+    if (user) await modLog('unmute_user', user.username, 'global');
+    res.json({ success: true });
+  } catch(e) { res.status(500).json({ error: 'Server error' }); }
 });
 
-// Remove single user from whitelist (mod panel)
-app.delete('/api/mod/rooms/:id/whitelist/:userId', (req, res) => {
+app.post('/api/mod/users/:id/setmod', async (req, res) => {
   if (!checkMod(req, res)) return;
-  db.prepare('DELETE FROM room_whitelist WHERE room_id = ? AND user_id = ?').run(Number(req.params.id), Number(req.params.userId));
-  res.json({ success: true });
+  try {
+    const { is_mod } = req.body;
+    const user = await q1('SELECT username FROM users WHERE id = $1', [req.params.id]);
+    await pool.query('UPDATE users SET is_mod = $1 WHERE id = $2', [is_mod ? 1 : 0, req.params.id]);
+    if (user) await modLog(is_mod ? 'grant_mod' : 'revoke_mod', user.username);
+    res.json({ success: true });
+  } catch(e) { res.status(500).json({ error: 'Server error' }); }
 });
 
-app.post('/api/mod/rooms/:id/server-message', (req, res) => {
+app.delete('/api/mod/users/:id', async (req, res) => {
   if (!checkMod(req, res)) return;
-  const { message } = req.body;
-  const room = db.prepare('SELECT * FROM rooms WHERE id = ?').get(req.params.id);
-  if (!room) return res.status(404).json({ error: 'Room not found' });
-  // General room IS allowed to have its server_message changed via mod panel
-  db.prepare('UPDATE rooms SET server_message = ? WHERE id = ?').run(message || '', room.id);
-  modLog('set_server_msg', room.name, (message || '').slice(0, 60));
-  res.json({ success: true });
+  try {
+    const user = await q1('SELECT username FROM users WHERE id = $1', [req.params.id]);
+    await pool.query('DELETE FROM messages WHERE user_id = $1', [req.params.id]);
+    await pool.query('DELETE FROM direct_messages WHERE sender_id = $1 OR receiver_id = $1', [req.params.id, req.params.id]);
+    await pool.query('DELETE FROM room_whitelist WHERE user_id = $1', [req.params.id]);
+    await pool.query('DELETE FROM room_mutes WHERE user_id = $1', [req.params.id]);
+    await pool.query('DELETE FROM users WHERE id = $1', [req.params.id]);
+    await pool.query('UPDATE rooms SET message_count = (SELECT COUNT(*) FROM messages WHERE room_id = rooms.id)');
+    if (user) await modLog('delete_user', user.username);
+    res.json({ success: true });
+  } catch(e) { res.status(500).json({ error: 'Server error' }); }
 });
 
-// Change master password
-app.post('/api/mod/change-password', (req, res) => {
+app.delete('/api/mod/users/:id/messages', async (req, res) => {
   if (!checkMod(req, res)) return;
-  const { newPassword } = req.body;
-  if (!newPassword || newPassword.length < 4) return res.status(400).json({ error: 'New password must be at least 4 characters' });
-  config.masterPassword = newPassword;
-  saveConfig(config);
-  modLog('change_master_pw', 'system');
-  res.json({ success: true });
+  try {
+    const user = await q1('SELECT username FROM users WHERE id = $1', [req.params.id]);
+    await pool.query('DELETE FROM messages WHERE user_id = $1', [req.params.id]);
+    await pool.query('UPDATE rooms SET message_count = (SELECT COUNT(*) FROM messages WHERE room_id = rooms.id)');
+    if (user) await modLog('clear_messages', user.username);
+    res.json({ success: true });
+  } catch(e) { res.status(500).json({ error: 'Server error' }); }
 });
 
-// Get current IP of caller (for diagnostics)
+app.delete('/api/mod/rooms/:id', async (req, res) => {
+  if (!checkMod(req, res)) return;
+  try {
+    const room = await q1('SELECT * FROM rooms WHERE id = $1', [req.params.id]);
+    if (!room) return res.status(404).json({ error: 'Not found' });
+    if (room.is_general) return res.status(403).json({ error: 'Cannot delete General' });
+    await pool.query('DELETE FROM messages WHERE room_id = $1', [room.id]);
+    await pool.query('DELETE FROM room_whitelist WHERE room_id = $1', [room.id]);
+    await pool.query('DELETE FROM room_mutes WHERE room_id = $1', [room.id]);
+    await pool.query('DELETE FROM rooms WHERE id = $1', [room.id]);
+    await modLog('delete_room', room.name);
+    res.json({ success: true });
+  } catch(e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+app.delete('/api/mod/messages/:id', async (req, res) => {
+  if (!checkMod(req, res)) return;
+  try {
+    const msg = await q1('SELECT room_id FROM messages WHERE id = $1', [req.params.id]);
+    await pool.query('DELETE FROM messages WHERE id = $1', [req.params.id]);
+    if (msg) await pool.query('UPDATE rooms SET message_count = (SELECT COUNT(*) FROM messages WHERE room_id = $1) WHERE id = $1', [msg.room_id]);
+    await modLog('delete_message', '#' + req.params.id);
+    res.json({ success: true });
+  } catch(e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+app.post('/api/mod/ban-ip', async (req, res) => {
+  if (!checkMod(req, res)) return;
+  try {
+    const { ip, reason } = req.body;
+    if (!ip) return res.status(400).json({ error: 'IP required' });
+    await pool.query('INSERT INTO banned_ips (ip, reason) VALUES ($1, $2) ON CONFLICT (ip) DO UPDATE SET reason = $2', [ip, reason || '']);
+    await modLog('ban_ip', ip, reason || '');
+    res.json({ success: true });
+  } catch(e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+app.post('/api/mod/unban-ip', async (req, res) => {
+  if (!checkMod(req, res)) return;
+  try {
+    const { ip } = req.body;
+    await pool.query('DELETE FROM banned_ips WHERE ip = $1', [ip]);
+    await modLog('unban_ip', ip);
+    res.json({ success: true });
+  } catch(e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+app.post('/api/mod/rooms/:id/server-message', async (req, res) => {
+  if (!checkMod(req, res)) return;
+  try {
+    const { message } = req.body;
+    const room = await q1('SELECT * FROM rooms WHERE id = $1', [req.params.id]);
+    if (!room) return res.status(404).json({ error: 'Room not found' });
+    await pool.query('UPDATE rooms SET server_message = $1 WHERE id = $2', [message || '', room.id]);
+    await modLog('set_server_msg', room.name, (message || '').slice(0, 60));
+    res.json({ success: true });
+  } catch(e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+app.delete('/api/mod/rooms/:id/whitelist', async (req, res) => {
+  if (!checkMod(req, res)) return;
+  try {
+    const room = await q1('SELECT name FROM rooms WHERE id = $1', [req.params.id]);
+    await pool.query('DELETE FROM room_whitelist WHERE room_id = $1', [req.params.id]);
+    if (room) await modLog('whitelist_clear', room.name, 'via mod panel');
+    res.json({ success: true });
+  } catch(e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+app.delete('/api/mod/rooms/:id/whitelist/:userId', async (req, res) => {
+  if (!checkMod(req, res)) return;
+  try {
+    await pool.query('DELETE FROM room_whitelist WHERE room_id = $1 AND user_id = $2', [req.params.id, req.params.userId]);
+    res.json({ success: true });
+  } catch(e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+app.post('/api/mod/change-password', async (req, res) => {
+  if (!checkMod(req, res)) return;
+  try {
+    const { newPassword } = req.body;
+    if (!newPassword || newPassword.length < 4) return res.status(400).json({ error: 'Password must be at least 4 characters' });
+    MASTER_PASSWORD = newPassword;
+    await modLog('change_master_pw', 'system');
+    res.json({ success: true });
+  } catch(e) { res.status(500).json({ error: 'Server error' }); }
+});
+
 app.get('/api/mod/my-ip', (req, res) => {
   res.json({ ip: getClientIp(req) });
 });
 
-app.post('/api/admin/reset', (req, res) => {
-  const { password } = req.body;
-  if (!isMaster(password)) return res.status(403).json({ error: 'Forbidden' });
-  resetMessages();
-  modLog('force_reset', 'all rooms');
-  res.json({ success: true });
+app.post('/api/admin/reset', async (req, res) => {
+  try {
+    const { password } = req.body;
+    if (!isMaster(password)) return res.status(403).json({ error: 'Forbidden' });
+    await resetMessages();
+    await modLog('force_reset', 'all rooms');
+    res.json({ success: true });
+  } catch(e) { res.status(500).json({ error: 'Server error' }); }
 });
 
+// ── Start ─────────────────────────────────────────────────────────────────────
+
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => console.log(`Chat server running on port ${PORT}`));
+initDb().then(() => {
+  scheduleNextReset();
+  app.listen(PORT, () => console.log(`Chat server running on port ${PORT}`));
+}).catch(e => {
+  console.error('Failed to init database:', e);
+  process.exit(1);
+});
